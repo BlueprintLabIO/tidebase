@@ -12,6 +12,7 @@
     RotateCcw,
     Search,
     Server,
+    ShieldAlert,
     Waves,
     Webhook,
     XCircle
@@ -37,8 +38,17 @@
     name: string
     status: RunStatus
     attempt: number
+    resumeContract?: ResumeContract
     output: unknown
     error: unknown
+  }
+
+  type ResumeContract = {
+    sideEffects: string[]
+    idempotencyKey: string | null
+    replay: 'auto' | 'manual' | 'never' | string
+    checkpointInvariant: unknown
+    verifiedBy: unknown
   }
 
   type RunEvent = {
@@ -136,9 +146,9 @@
 
   const selectedRun = $derived(detail?.run ?? runs.find((run) => run.id === selectedRunId) ?? null)
   const completedSteps = $derived(detail?.steps.filter((step) => step.status === 'completed').length ?? 0)
-  const failedSteps = $derived(detail?.steps.filter((step) => step.status === 'failed').length ?? 0)
+  const failedSteps = $derived(detail?.steps.filter((step) => step.status.includes('failed') || step.status === 'manual_review').length ?? 0)
   const latestError = $derived(
-    detail?.steps.find((step) => step.status === 'failed')?.error ?? detail?.run.error ?? null
+    detail?.steps.find((step) => step.status.includes('failed') || step.status === 'manual_review')?.error ?? detail?.run.error ?? null
   )
   const loadingError = $derived(
     runsQuery.error instanceof Error
@@ -221,6 +231,19 @@
 
   function json(value: unknown) {
     return JSON.stringify(value ?? {}, null, 2)
+  }
+
+  function contractLabel(contract?: ResumeContract) {
+    if (!contract) return 'no contract'
+    if (contract.replay === 'auto') return 'safe replay'
+    if (contract.replay === 'manual') return 'manual review'
+    if (contract.replay === 'never') return 'fail hard'
+    return contract.replay
+  }
+
+  function sideEffectLabel(contract?: ResumeContract) {
+    if (!contract?.sideEffects.length) return 'no side effects'
+    return contract.sideEffects.join(', ')
   }
 </script>
 
@@ -393,9 +416,11 @@
 {#snippet statusIcon(status: string)}
   {#if status === 'completed'}
     <CheckCircle2 size={15} />
+  {:else if status === 'manual_review'}
+    <ShieldAlert size={15} />
   {:else if status === 'failed'}
     <XCircle size={15} />
-  {:else if status === 'running'}
+  {:else if status === 'running' || status === 'failed_retryable'}
     <RotateCcw size={15} />
   {:else}
     <Clock3 size={15} />
@@ -493,7 +518,32 @@
                       <strong>{step.name}</strong>
                       <small>{step.status}</small>
                     </div>
-                    <span class="badge">attempt {step.attempt}</span>
+                    <div class="step-actions">
+                      <span class="badge {step.resumeContract?.replay === 'manual' ? 'manual_review' : step.resumeContract?.replay === 'auto' ? 'completed' : 'failed'}">
+                        {contractLabel(step.resumeContract)}
+                      </span>
+                      <span class="badge">attempt {step.attempt}</span>
+                    </div>
+                  </div>
+                  <div class="contract-grid">
+                    <div>
+                      <span class="meta">Side effects</span>
+                      <strong class="truncate">{sideEffectLabel(step.resumeContract)}</strong>
+                    </div>
+                    <div>
+                      <span class="meta">Idempotency</span>
+                      <strong class="mono truncate">{step.resumeContract?.idempotencyKey ?? '-'}</strong>
+                    </div>
+                    <div>
+                      <span class="meta">Checkpoint invariant</span>
+                      <strong class="truncate">
+                        {typeof step.resumeContract?.checkpointInvariant === 'string'
+                          ? step.resumeContract.checkpointInvariant
+                          : step.resumeContract?.checkpointInvariant
+                            ? JSON.stringify(step.resumeContract.checkpointInvariant)
+                            : '-'}
+                      </strong>
+                    </div>
                   </div>
                   {#if step.error}
                     <div style="margin-top: 10px;">{@render code(step.error)}</div>
@@ -555,6 +605,8 @@
             <th>Step</th>
             <th>Status</th>
             <th>Attempt</th>
+            <th>Replay</th>
+            <th>Side effects</th>
             <th>Checkpoint payload</th>
           </tr>
         </thead>
@@ -564,6 +616,8 @@
               <td>{step.name}</td>
               <td>{@render StatusChip(step.status)}</td>
               <td>{step.attempt}</td>
+              <td><span class="badge {step.resumeContract?.replay === 'manual' ? 'manual_review' : step.resumeContract?.replay === 'auto' ? 'completed' : 'failed'}">{contractLabel(step.resumeContract)}</span></td>
+              <td><span class="mono truncate">{sideEffectLabel(step.resumeContract)}</span></td>
               <td><span class="mono truncate">{step.status === 'completed' ? JSON.stringify(step.output ?? {}) : JSON.stringify(step.error ?? {})}</span></td>
             </tr>
           {/each}

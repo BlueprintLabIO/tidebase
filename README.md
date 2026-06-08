@@ -102,12 +102,40 @@ await tide.run('generate-report', { runId }, async (run, input) => {
 })
 ```
 
+## Resume Contracts
+
+Each step can declare the operational contract Tidebase should record for replay:
+
+```typescript
+await run.step(
+  'send-email',
+  {
+    input: { userId },
+    sideEffects: ['email.send'],
+    idempotencyKey: `welcome:${userId}`,
+    replay: 'auto',
+    checkpointInvariant: 'provider accepted the message id',
+    verifiedBy: 'email provider response'
+  },
+  () => sendWelcomeEmail(userId)
+)
+```
+
+The alpha stores this contract with the step, shows it in Studio, and records it in step events. Final step failures are classified as:
+
+- `failed_retryable` when the SDK still has retries left.
+- `manual_review` when replay is declared as manual, or when external side effects are present without an idempotency key.
+- `failed` for hard failures.
+
+This does not make external systems exactly-once. It makes the resume decision explicit instead of hiding it in logs and custom retry flags.
+
 ## Current Scope
 
 - Postgres-backed run store
 - named checkpointed steps
 - run and step leases
 - input-hash checks to prevent stale checkpoint reuse
+- step resume contracts for side effects, idempotency keys, replay policy, and checkpoint invariants
 - live state set/patch
 - append-only run events
 - SSE event stream

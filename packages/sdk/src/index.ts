@@ -24,7 +24,18 @@ export type StepOptions = {
   inputHash?: string
   retries?: number
   timeoutMs?: number
+  sideEffects?: string[]
+  idempotencyKey?: string
+  replay?: 'auto' | 'manual' | 'never'
+  checkpointInvariant?: string | Record<string, unknown>
+  verifiedBy?: string | Record<string, unknown>
+  /**
+   * @deprecated Use sideEffects for named external operations.
+   */
   sideEffect?: 'none' | 'read' | 'write' | 'external'
+  /**
+   * @deprecated Use replay.
+   */
   onAmbiguousFailure?: 'retry' | 'fail' | 'review'
 }
 
@@ -346,6 +357,7 @@ export class RunContext {
           body: JSON.stringify({
             leaseOwner: begin.leaseOwner,
             retryable,
+            resumeDecision: retryable ? 'auto_retry' : classifyResumeDecision(options),
             error: serializeError(error)
           })
         }).catch(() => undefined)
@@ -354,6 +366,26 @@ export class RunContext {
     }
     throw new Error(`Step ${name} failed`)
   }
+}
+
+function classifyResumeDecision(options: StepOptions) {
+  if (options.replay === 'manual' || options.onAmbiguousFailure === 'review') {
+    return 'manual_review'
+  }
+  if (options.replay === 'never' || options.onAmbiguousFailure === 'fail') {
+    return 'fail_hard'
+  }
+  if (options.replay === 'auto' || options.onAmbiguousFailure === 'retry') {
+    return 'safe_replay'
+  }
+  const namedSideEffects = options.sideEffects?.filter(Boolean) ?? []
+  const legacySideEffect = options.sideEffect ?? 'none'
+  const writesExternally =
+    namedSideEffects.length > 0 || legacySideEffect === 'write' || legacySideEffect === 'external'
+  if (writesExternally && !options.idempotencyKey) {
+    return 'manual_review'
+  }
+  return 'fail_hard'
 }
 
 export class RunState {

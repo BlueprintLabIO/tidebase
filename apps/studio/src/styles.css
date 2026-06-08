@@ -516,10 +516,19 @@ h2 {
 
 .badge.running,
 .chip.running,
+.badge.failed_retryable,
+.chip.failed_retryable,
 .badge.connected {
   background: var(--active-bg);
   border-color: #96deeb;
   color: var(--active);
+}
+
+.badge.manual_review,
+.chip.manual_review {
+  background: var(--warning-bg);
+  border-color: #e5c064;
+  color: var(--warning);
 }
 
 .badge.failed,
@@ -662,6 +671,35 @@ h2 {
   justify-content: space-between;
 }
 
+.step-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  justify-content: flex-end;
+}
+
+.contract-grid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-top: 12px;
+}
+
+.contract-grid > div {
+  background: rgba(245, 239, 225, 0.68);
+  border: 1px solid rgba(183, 204, 200, 0.82);
+  border-radius: var(--radius);
+  min-width: 0;
+  padding: 9px;
+}
+
+.contract-grid strong {
+  color: var(--abyss);
+  font-size: 12px;
+  margin-top: 4px;
+}
+
 .chip {
   border: 1px solid var(--rule);
   border-radius: var(--radius);
@@ -711,7 +749,8 @@ h2 {
 
   .metrics,
   .workspace,
-  .facts {
+  .facts,
+  .contract-grid {
     grid-template-columns: 1fr;
   }
 }

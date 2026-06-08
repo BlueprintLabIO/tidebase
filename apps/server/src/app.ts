@@ -33,7 +33,8 @@ const completeStepSchema = z.object({
 const failStepSchema = z.object({
   leaseOwner: z.string(),
   error: z.unknown(),
-  retryable: z.boolean().optional()
+  retryable: z.boolean().optional(),
+  resumeDecision: z.enum(['auto_retry', 'safe_replay', 'manual_review', 'fail_hard']).optional()
 })
 
 const stateSchema = z.object({
@@ -148,6 +149,7 @@ export function createApp() {
         `update runs
          set status = 'completed',
              result_json = $2,
+             error_json = null,
              lease_owner = null,
              lease_expires_at = null,
              completed_at = now(),
@@ -265,7 +267,8 @@ export function createApp() {
       await appendEvent(client, runId, 'step.started', {
         stepId: upsert.rows[0].id,
         name: body.name,
-        attempt: upsert.rows[0].attempt
+        attempt: upsert.rows[0].attempt,
+        resumeContract: normalizeResumeContract(upsert.rows[0].options_json)
       })
       return { action: 'execute', step: mapStep(upsert.rows[0]), leaseOwner }
     })
@@ -294,7 +297,9 @@ export function createApp() {
       if (!update.rows[0]) return null
       await appendEvent(client, runId, 'step.completed', {
         stepId,
-        name: update.rows[0].name
+        name: update.rows[0].name,
+        checkpointInvariant: normalizeResumeContract(update.rows[0].options_json).checkpointInvariant,
+        verifiedBy: normalizeResumeContract(update.rows[0].options_json).verifiedBy
       })
       return mapStep(update.rows[0])
     })
@@ -307,6 +312,12 @@ export function createApp() {
     const stepId = c.req.param('stepId')
     const body = failStepSchema.parse(await c.req.json())
     const result = await tx(async (client) => {
+      const existing = await client.query(
+        `select options_json from steps where id = $1 and run_id = $2`,
+        [stepId, runId]
+      )
+      const resumeDecision =
+        body.resumeDecision ?? classifyResumeDecision(existing.rows[0]?.options_json, body.retryable ?? false)
       const update = await client.query(
         `update steps
          set status = $5,
@@ -321,7 +332,7 @@ export function createApp() {
           runId,
           body.leaseOwner,
           json(body.error),
-          body.retryable ? 'failed_retryable' : 'failed'
+          statusForResumeDecision(body.retryable ?? false, resumeDecision)
         ]
       )
       if (!update.rows[0]) return null
@@ -329,6 +340,8 @@ export function createApp() {
         stepId,
         name: update.rows[0].name,
         retryable: body.retryable ?? false,
+        resumeDecision,
+        resumeContract: normalizeResumeContract(update.rows[0].options_json),
         error: body.error
       })
       return mapStep(update.rows[0])
@@ -509,6 +522,57 @@ function json(value: unknown) {
   return JSON.stringify(value)
 }
 
+function normalizeResumeContract(optionsJson: unknown) {
+  const options = isRecord(optionsJson) ? optionsJson : {}
+  const legacySideEffect = typeof options.sideEffect === 'string' ? options.sideEffect : 'none'
+  const sideEffects = Array.isArray(options.sideEffects)
+    ? options.sideEffects.filter((item): item is string => typeof item === 'string' && item.length > 0)
+    : legacySideEffect !== 'none'
+      ? [legacySideEffect]
+      : []
+  const replay =
+    options.replay === 'auto' || options.replay === 'manual' || options.replay === 'never'
+      ? options.replay
+      : options.onAmbiguousFailure === 'retry'
+        ? 'auto'
+        : options.onAmbiguousFailure === 'review'
+          ? 'manual'
+          : options.onAmbiguousFailure === 'fail'
+            ? 'never'
+            : inferReplay(sideEffects, typeof options.idempotencyKey === 'string')
+
+  return {
+    sideEffects,
+    idempotencyKey: typeof options.idempotencyKey === 'string' ? options.idempotencyKey : null,
+    replay,
+    checkpointInvariant: options.checkpointInvariant ?? null,
+    verifiedBy: options.verifiedBy ?? null
+  }
+}
+
+function inferReplay(sideEffects: string[], hasIdempotencyKey: boolean) {
+  if (sideEffects.length === 0 || sideEffects.every((effect) => effect === 'read')) return 'auto'
+  return hasIdempotencyKey ? 'auto' : 'manual'
+}
+
+function classifyResumeDecision(optionsJson: unknown, retryable: boolean) {
+  if (retryable) return 'auto_retry'
+  const contract = normalizeResumeContract(optionsJson)
+  if (contract.replay === 'manual') return 'manual_review'
+  if (contract.replay === 'auto') return 'safe_replay'
+  return 'fail_hard'
+}
+
+function statusForResumeDecision(retryable: boolean, decision: string) {
+  if (retryable || decision === 'auto_retry') return 'failed_retryable'
+  if (decision === 'manual_review') return 'manual_review'
+  return 'failed'
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
 function mapStep(row: Record<string, any>) {
   return {
     id: row.id as string,
@@ -517,6 +581,7 @@ function mapStep(row: Record<string, any>) {
     inputHash: row.input_hash as string,
     input: row.input_json,
     options: row.options_json,
+    resumeContract: normalizeResumeContract(row.options_json),
     status: row.status as string,
     output: row.output_json,
     error: row.error_json,

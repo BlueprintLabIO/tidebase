@@ -16,7 +16,9 @@ export const researchReport: TideWorkflow<{ topic: string }, { report: string }>
     'fetch-sources',
     {
       input: { sections: plan.sections },
-      sideEffect: 'read'
+      sideEffects: ['source.fetch'],
+      replay: 'auto',
+      checkpointInvariant: 'source list captured for the planned sections'
     },
     async () => {
       await delay(250)
@@ -34,17 +36,26 @@ export const researchReport: TideWorkflow<{ topic: string }, { report: string }>
     sections: plan.sections
   })
 
-  const report = await run.step('write-report', async () => {
-    await delay(250)
-    if (process.env.FAIL_WRITE === '1') {
-      throw new Error('Simulated write failure after plan and fetch checkpoints')
+  const report = await run.step(
+    'write-report',
+    {
+      sideEffects: ['report.write'],
+      replay: 'manual',
+      checkpointInvariant: 'report text was generated and returned by the step',
+      verifiedBy: 'example workflow result'
+    },
+    async () => {
+      await delay(250)
+      if (process.env.FAIL_WRITE === '1') {
+        throw new Error('Simulated write failure after plan and fetch checkpoints')
+      }
+      return [
+        `Report: ${input.topic}`,
+        '',
+        ...sources.map((source, index) => `${index + 1}. ${source}`)
+      ].join('\n')
     }
-    return [
-      `Report: ${input.topic}`,
-      '',
-      ...sources.map((source, index) => `${index + 1}. ${source}`)
-    ].join('\n')
-  })
+  )
 
   await run.state.patch({
     status: 'completed',
