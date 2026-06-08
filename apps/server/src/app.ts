@@ -56,8 +56,8 @@ export function createApp() {
          returning *`,
         [
           workflowName,
-          body.input ?? {},
-          body.metadata ?? {},
+          json(body.input ?? {}),
+          json(body.metadata ?? {}),
           body.recoveryWebhook ?? null
         ]
       )
@@ -153,7 +153,7 @@ export function createApp() {
              updated_at = now()
          where id = $1
          returning *`,
-        [runId, body.result ?? null]
+        [runId, json(body.result ?? null)]
       )
       if (!update.rows[0]) return null
       await appendEvent(client, runId, 'run.completed', {
@@ -178,7 +178,7 @@ export function createApp() {
              updated_at = now()
          where id = $1
          returning *`,
-        [runId, body.error ?? {}]
+        [runId, json(body.error ?? {})]
       )
       if (!update.rows[0]) return null
       await appendEvent(client, runId, 'run.failed', { error: body.error ?? {} })
@@ -247,8 +247,8 @@ export function createApp() {
           runId,
           body.name,
           body.inputHash,
-          body.input ?? {},
-          body.options ?? {},
+          json(body.input ?? {}),
+          json(body.options ?? {}),
           leaseOwner,
           leaseMs
         ]
@@ -280,7 +280,7 @@ export function createApp() {
              updated_at = now()
          where id = $1 and run_id = $2 and lease_owner = $3
          returning *`,
-        [stepId, runId, body.leaseOwner, body.output ?? null]
+        [stepId, runId, body.leaseOwner, json(body.output ?? null)]
       )
       if (!update.rows[0]) return null
       await appendEvent(client, runId, 'step.completed', {
@@ -311,7 +311,7 @@ export function createApp() {
           stepId,
           runId,
           body.leaseOwner,
-          body.error,
+          json(body.error),
           body.retryable ? 'failed_retryable' : 'failed'
         ]
       )
@@ -340,7 +340,7 @@ export function createApp() {
                        version = run_state.version + 1,
                        updated_at = now()
          returning *`,
-        [runId, body.value ?? {}]
+        [runId, json(body.value ?? {})]
       )
       await appendEvent(client, runId, 'state.updated', { value: body.value })
       return mapState(result.rows[0])
@@ -360,7 +360,7 @@ export function createApp() {
                        version = run_state.version + 1,
                        updated_at = now()
          returning *`,
-        [runId, body.value ?? {}]
+        [runId, json(body.value ?? {})]
       )
       await appendEvent(client, runId, 'state.updated', { value: result.rows[0].value_json })
       return mapState(result.rows[0])
@@ -496,6 +496,10 @@ function mapRun(row: Record<string, any>) {
     updatedAt: row.updated_at.toISOString(),
     completedAt: row.completed_at?.toISOString?.() ?? null
   }
+}
+
+function json(value: unknown) {
+  return JSON.stringify(value)
 }
 
 function mapStep(row: Record<string, any>) {

@@ -46,7 +46,7 @@ export async function appendEvent(
     `insert into events (run_id, seq, type, payload_json)
      values ($1, $2, $3, $4)
      returning id, run_id, seq, type, payload_json, created_at`,
-    [runId, seq, type, payload]
+    [runId, seq, type, JSON.stringify(payload ?? {})]
   )
   const event = mapEvent(result.rows[0])
   queueMicrotask(() => {
