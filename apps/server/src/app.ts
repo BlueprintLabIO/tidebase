@@ -136,6 +136,7 @@ export function createApp() {
       return mapRun(update.rows[0])
     })
     if (!run) return c.json({ error: 'run not found' }, 404)
+    if ('locked' in run) return c.json({ error: 'run is leased', leaseOwner: run.leaseOwner }, 409)
     return c.json({ run, leaseOwner })
   })
 
@@ -213,6 +214,14 @@ export function createApp() {
         [runId, body.name]
       )
       const existingStep = existing.rows[0]
+      if (existingStep && existingStep.input_hash !== body.inputHash) {
+        return {
+          action: 'input_mismatch',
+          step: mapStep(existingStep),
+          expectedInputHash: existingStep.input_hash,
+          actualInputHash: body.inputHash
+        }
+      }
       if (existingStep?.status === 'completed') {
         return { action: 'return', step: mapStep(existingStep), output: existingStep.output_json }
       }
@@ -374,14 +383,12 @@ export function createApp() {
     return streamSSE(c, async (stream) => {
       for (const event of await listEvents(runId, after)) {
         await stream.writeSSE({
-          event: event.type,
           id: String(event.seq),
           data: JSON.stringify(event)
         })
       }
       const unsubscribe = subscribe(runId, (event) => {
         void stream.writeSSE({
-          event: event.type,
           id: String(event.seq),
           data: JSON.stringify(event)
         })

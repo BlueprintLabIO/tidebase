@@ -139,6 +139,16 @@ export class Tidebase {
           })
         : await this.runs.get(options.runId).then((detail) => detail.run)
 
+    if (run.workflowName !== workflowName) {
+      throw new Error(
+        `Run ${run.id} belongs to workflow ${run.workflowName}, not ${workflowName}`
+      )
+    }
+
+    if (run.status === 'completed') {
+      return run.result as TResult
+    }
+
     const begin = await this.request<{ run: TideRun; leaseOwner: string }>(
       `/runs/${run.id}/begin`,
       { method: 'POST' }
@@ -287,6 +297,12 @@ export class RunContext {
       | { action: 'return'; output: TResult }
       | { action: 'execute'; step: { id: string }; leaseOwner: string }
       | { action: 'locked'; step: { id: string; name: string } }
+      | {
+          action: 'input_mismatch'
+          step: { id: string; name: string }
+          expectedInputHash: string
+          actualInputHash: string
+        }
     >(`/runs/${this.runId}/steps/begin`, {
       method: 'POST',
       body: JSON.stringify({
@@ -299,6 +315,11 @@ export class RunContext {
     })
 
     if (begin.action === 'return') return begin.output
+    if (begin.action === 'input_mismatch') {
+      throw new Error(
+        `Step ${name} input hash changed for this run. Expected ${begin.expectedInputHash}, got ${begin.actualInputHash}`
+      )
+    }
     if (begin.action === 'locked') {
       throw new Error(`Step ${name} is currently leased by another worker`)
     }

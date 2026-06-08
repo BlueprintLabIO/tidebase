@@ -107,6 +107,7 @@ await tide.run('generate-report', { runId }, async (run, input) => {
 - Postgres-backed run store
 - named checkpointed steps
 - run and step leases
+- input-hash checks to prevent stale checkpoint reuse
 - live state set/patch
 - append-only run events
 - SSE event stream
@@ -125,3 +126,14 @@ await tide.run('generate-report', { runId }, async (run, input) => {
 - memory
 - auth
 - hosted cloud
+
+## Alpha Notes
+
+This is ready for local demos and early feedback, not production.
+
+Important limits:
+
+- The server currently auto-runs the SQL schema on boot; a real migration runner is planned.
+- There is no API authentication yet. Run it only in trusted local/self-hosted environments.
+- External side effects still need idempotency keys in user code.
+- Tidebase remembers what happened and can call recovery webhooks, but it does not guarantee that user code will be available to resume.
