@@ -18,14 +18,14 @@ Install dependencies:
 pnpm install
 ```
 
-Run the server and dashboard:
+Run the server and Studio:
 
 ```bash
 pnpm dev
 ```
 
 - Server: http://localhost:7373
-- Dashboard: http://localhost:5173
+- Studio: http://localhost:5173
 
 Run the dogfood workflow:
 
@@ -39,7 +39,7 @@ Force a failure after two completed checkpoints:
 FAIL_WRITE=1 pnpm example
 ```
 
-Copy the run id from the dashboard or API, then resume:
+Copy the run id from Studio or the API, then resume:
 
 ```bash
 TIDEBASE_RUN_ID=run_xxx pnpm example
@@ -113,7 +113,7 @@ await tide.run('generate-report', { runId }, async (run, input) => {
 - SSE event stream
 - signed recovery webhooks
 - TypeScript SDK
-- dashboard timeline
+- Studio run timeline
 - dogfood workflow
 
 ## Not In This Alpha

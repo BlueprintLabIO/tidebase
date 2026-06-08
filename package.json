@@ -5,9 +5,10 @@
   "license": "Apache-2.0",
   "type": "module",
   "scripts": {
-    "dev": "pnpm --parallel --filter @tidebase/server --filter @tidebase/dashboard dev",
+    "dev": "pnpm --parallel --filter @tidebase/server --filter @tidebase/studio dev",
     "server": "pnpm --filter @tidebase/server dev",
-    "dashboard": "pnpm --filter @tidebase/dashboard dev",
+    "studio": "pnpm --filter @tidebase/studio dev",
+    "dashboard": "pnpm studio",
     "preexample": "pnpm --filter @tidebase/sdk build",
     "example": "pnpm --filter @tidebase/example-report dev",
     "preexample:webhook": "pnpm --filter @tidebase/sdk build",
