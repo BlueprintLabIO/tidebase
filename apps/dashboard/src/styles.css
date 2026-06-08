@@ -1,250 +1,118 @@
-:root {
-  background: #f6f4ee;
-  color: #17221d;
-  font-family:
-    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
-    sans-serif;
-}
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/geist";
 
-* {
-  box-sizing: border-box;
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  --background: oklch(0.975 0.018 195);
+  --foreground: oklch(0.22 0.045 217);
+  --card: oklch(0.992 0.006 92);
+  --card-foreground: oklch(0.22 0.045 217);
+  --popover: oklch(0.992 0.006 92);
+  --popover-foreground: oklch(0.22 0.045 217);
+  --primary: oklch(0.42 0.105 217);
+  --primary-foreground: oklch(0.985 0.02 195);
+  --secondary: oklch(0.925 0.038 195);
+  --secondary-foreground: oklch(0.28 0.07 217);
+  --muted: oklch(0.94 0.02 91);
+  --muted-foreground: oklch(0.48 0.035 217);
+  --accent: oklch(0.91 0.055 190);
+  --accent-foreground: oklch(0.26 0.075 217);
+  --destructive: oklch(0.58 0.19 28);
+  --border: oklch(0.84 0.025 92);
+  --input: oklch(0.84 0.025 92);
+  --ring: oklch(0.64 0.13 195);
+  --chart-1: oklch(0.64 0.13 195);
+  --chart-2: oklch(0.48 0.11 217);
+  --chart-3: oklch(0.73 0.09 177);
+  --chart-4: oklch(0.74 0.12 76);
+  --chart-5: oklch(0.62 0.16 35);
+  --sidebar: oklch(0.27 0.075 217);
+  --sidebar-foreground: oklch(0.955 0.025 195);
+  --sidebar-primary: oklch(0.78 0.11 185);
+  --sidebar-primary-foreground: oklch(0.19 0.055 217);
+  --sidebar-accent: oklch(0.35 0.085 211);
+  --sidebar-accent-foreground: oklch(0.98 0.02 195);
+  --sidebar-border: oklch(0.42 0.075 211);
+  --sidebar-ring: oklch(0.75 0.12 185);
+  --radius: 0.625rem;
+  --header-height: 4rem;
 }
 
 body {
   margin: 0;
+  background:
+    linear-gradient(180deg, rgba(128, 224, 225, 0.22), rgba(247, 243, 232, 0) 320px),
+    var(--background);
+  font-family: "Geist Variable", Inter, ui-sans-serif, system-ui, sans-serif;
 }
 
 button {
-  color: inherit;
-  font: inherit;
-}
-
-.shell {
-  min-height: 100vh;
-  padding: 24px;
-}
-
-.topbar {
-  align-items: center;
-  display: flex;
-  justify-content: space-between;
-  margin: 0 auto 18px;
-  max-width: 1380px;
-}
-
-.eyebrow {
-  color: #527061;
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0;
-  text-transform: uppercase;
-}
-
-h1,
-h2,
-h3,
-p {
-  margin: 0;
-}
-
-h1 {
-  font-size: 34px;
-  line-height: 1.1;
-}
-
-h2 {
-  font-size: 18px;
-}
-
-h3 {
-  font-size: 14px;
-  margin-bottom: 12px;
-}
-
-.layout {
-  display: grid;
-  gap: 16px;
-  grid-template-columns: 320px minmax(0, 1fr);
-  margin: 0 auto;
-  max-width: 1380px;
-}
-
-.sidebar,
-.panel,
-.summary {
-  background: #fffdf8;
-  border: 1px solid #ded7c9;
-  border-radius: 8px;
-  box-shadow: 0 1px 0 rgba(24, 30, 25, 0.05);
-}
-
-.sidebar {
-  align-self: start;
-  padding: 14px;
-}
-
-.content,
-.detail {
-  min-width: 0;
-}
-
-.detail {
-  display: grid;
-  gap: 16px;
-}
-
-.summary {
-  align-items: center;
-  display: flex;
-  justify-content: space-between;
-  padding: 18px;
-}
-
-.grid {
-  display: grid;
-  gap: 16px;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-}
-
-.panel {
-  min-height: 220px;
-  padding: 14px;
-}
-
-.list {
-  display: grid;
-  gap: 8px;
-}
-
-.run-row,
-.step-row,
-.event-row {
-  align-items: center;
-  display: flex;
-  gap: 10px;
-}
-
-.run-row,
-.step-row {
-  background: #f7f4ec;
-  border: 1px solid transparent;
-  border-radius: 8px;
-  min-height: 58px;
-  padding: 10px;
-  text-align: left;
-  width: 100%;
-}
-
-.run-row {
   cursor: pointer;
 }
 
-.run-row.active {
-  background: #e7f0eb;
-  border-color: #a5c5b1;
+[data-slot="card"] {
+  border: 1px solid color-mix(in oklab, var(--primary) 12%, white);
+  box-shadow: 0 1px 1px rgba(8, 45, 58, 0.03), 0 16px 34px rgba(8, 45, 58, 0.06);
 }
 
-.run-row span,
-.step-row span,
-.event-row span {
-  display: grid;
-  gap: 3px;
-  min-width: 0;
+[data-slot="sidebar"] {
+  border-color: color-mix(in oklab, var(--sidebar-border) 42%, transparent);
 }
 
-small {
-  color: #66736b;
-  font-size: 12px;
-  overflow-wrap: anywhere;
+[data-slot="table-row"] {
+  border-color: color-mix(in oklab, var(--primary) 12%, white);
 }
 
-.badge,
-.icon-button {
+.status-icon-chip {
   align-items: center;
-  border-radius: 8px;
+  background: color-mix(in oklab, var(--primary) 10%, white);
+  border: 1px solid color-mix(in oklab, var(--primary) 18%, white);
+  border-radius: 0.5rem;
+  color: var(--primary);
   display: inline-flex;
+  height: 2rem;
   justify-content: center;
+  width: 2rem;
 }
 
-.badge {
-  background: #e8ece5;
-  font-size: 12px;
-  font-weight: 700;
-  padding: 6px 9px;
+.status-icon-chip svg {
+  height: 1rem;
+  width: 1rem;
 }
 
-.badge.completed {
-  background: #d8efd9;
-  color: #235328;
+.status-icon-chip.success {
+  background: #def7ec;
+  border-color: #b8ead4;
+  color: #14784f;
 }
 
-.badge.failed {
-  background: #ffd9d4;
-  color: #7b2118;
+.status-icon-chip.active {
+  background: #dff6fb;
+  border-color: #b4e7f0;
+  color: #087492;
 }
 
-.badge.running {
-  background: #d4e7ff;
-  color: #153d6b;
+.status-icon-chip.danger {
+  background: #ffe3de;
+  border-color: #ffc5bd;
+  color: #b13d31;
 }
 
-.icon-button {
-  background: #193d2b;
-  border: 0;
-  color: white;
-  cursor: pointer;
-  height: 38px;
-  width: 38px;
-}
-
-.ok {
-  color: #2f8d45;
-}
-
-.bad {
-  color: #c13a2c;
-}
-
-.active-icon {
-  color: #2d76b9;
-}
-
-pre {
-  background: #18221d;
-  border-radius: 8px;
-  color: #e6f0e8;
-  font-size: 12px;
-  line-height: 1.5;
+.code-block {
+  background: #082d3a;
+  border: 1px solid rgba(188, 239, 239, 0.16);
+  border-radius: 0.5rem;
+  color: #ddfffb;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 0.75rem;
+  line-height: 1.55;
   margin: 0;
-  max-height: 340px;
+  max-height: 24rem;
   overflow: auto;
-  padding: 12px;
-}
-
-.timeline {
-  display: grid;
-  gap: 10px;
-}
-
-.event-row {
-  align-items: flex-start;
-  border-bottom: 1px solid #eee7dc;
-  padding-bottom: 9px;
-}
-
-.empty {
-  color: #6a746d;
-  font-size: 14px;
-  padding: 18px 4px;
-}
-
-@media (max-width: 860px) {
-  .shell {
-    padding: 14px;
-  }
-
-  .layout,
-  .grid {
-    grid-template-columns: 1fr;
-  }
+  padding: 0.75rem;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
