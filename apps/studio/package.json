@@ -11,6 +11,8 @@
   },
   "dependencies": {
     "@fontsource-variable/geist": "^5.2.9",
+    "@fontsource-variable/newsreader": "^5.2.10",
+    "@fontsource/ibm-plex-mono": "^5.2.7",
     "@lucide/svelte": "^1.17.0",
     "@sveltejs/adapter-static": "^3.0.10",
     "@sveltejs/kit": "^2.63.1",

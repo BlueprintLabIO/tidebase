@@ -255,9 +255,13 @@
     </nav>
 
     <div class="sidebar-footer">
-      <button class="nav-button">
-        <Server size={17} /> Local alpha
-      </button>
+      <div class="server-status">
+        <Server size={17} />
+        <div>
+          <strong>Local alpha</strong>
+          <span>{API.replace(/^https?:\/\//, '')}</span>
+        </div>
+      </div>
     </div>
   </aside>
 
@@ -481,7 +485,7 @@
               <div class="step-row">
                 <div class="step-track">
                   <span class="chip {step.status}">{@render statusIcon(step.status)}</span>
-                  {#if index < (props.detail?.steps.length ?? 0) - 1}<span></span>{/if}
+                  {#if index < (props.detail?.steps.length ?? 0) - 1}<span class="track-line"></span>{/if}
                 </div>
                 <div class="step-card">
                   <div class="step-top">
