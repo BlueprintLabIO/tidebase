@@ -1,0 +1,22 @@
+{
+  "name": "tidebase",
+  "private": true,
+  "version": "0.0.0",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "pnpm --parallel --filter @tidebase/server --filter @tidebase/dashboard dev",
+    "server": "pnpm --filter @tidebase/server dev",
+    "dashboard": "pnpm --filter @tidebase/dashboard dev",
+    "example": "pnpm --filter @tidebase/example-report dev",
+    "example:webhook": "pnpm --filter @tidebase/example-report webhook",
+    "build": "pnpm -r build",
+    "check": "pnpm --filter @tidebase/sdk build && pnpm -r check",
+    "verify": "pnpm check && pnpm build"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.7",
+    "typescript": "^5.7.3"
+  },
+  "packageManager": "pnpm@10.28.0"
+}

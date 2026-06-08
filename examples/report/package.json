@@ -1,0 +1,17 @@
+{
+  "name": "@tidebase/example-report",
+  "private": true,
+  "version": "0.0.0",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "webhook": "tsx src/webhook.ts",
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@tidebase/sdk": "workspace:*",
+    "tsx": "^4.19.2"
+  }
+}
