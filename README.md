@@ -47,6 +47,22 @@ TIDEBASE_RUN_ID=run_xxx pnpm example
 
 The `plan` and `fetch-sources` steps are returned from checkpoints. Only `write-report` executes again.
 
+Run a local approval channel:
+
+```bash
+pnpm example:review
+```
+
+In another terminal, start a workflow that waits for approval:
+
+```bash
+REQUIRE_APPROVAL=1 \
+TIDEBASE_CHANNEL_WEBHOOK=http://localhost:8788/tidebase-events \
+pnpm example
+```
+
+Open http://localhost:8788, approve the gate, and the workflow continues. Studio shows the pending gate, channel delivery, decision actor, resume contracts, and final run timeline.
+
 ## Recovery Webhooks
 
 Tidebase can call back into your app when a run fails and has a recovery webhook configured. The SDK can handle that webhook and resume the matching workflow.
@@ -148,7 +164,7 @@ await tide.run(
 )
 ```
 
-Gates create durable decisions that can be resolved by a product UI, Slack/Teams adapter, internal tool, or Studio fallback:
+Gates create durable decisions that can be resolved by a product UI, Slack/Teams adapter, internal tool, local review page, or Studio fallback:
 
 ```typescript
 const decision = await run.gate('approve-send', {

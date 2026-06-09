@@ -31,10 +31,40 @@ export const researchReport: TideWorkflow<{ topic: string }, { report: string }>
   )
 
   await run.state.set({
-    status: 'writing',
+    status: process.env.REQUIRE_APPROVAL === '1' ? 'waiting_for_approval' : 'writing',
     progress: 0.7,
     sections: plan.sections
   })
+
+  if (process.env.REQUIRE_APPROVAL === '1') {
+    const decision = await run.gate('approve-report', {
+      prompt: `Send the ${input.topic} report?`,
+      data: {
+        topic: input.topic,
+        sections: plan.sections,
+        sourceCount: sources.length
+      },
+      channels: process.env.TIDEBASE_CHANNEL_WEBHOOK
+        ? [{
+            type: 'webhook',
+            url: process.env.TIDEBASE_CHANNEL_WEBHOOK,
+            events: ['gate.created']
+          }]
+        : [],
+      capability: {
+        name: 'report.write',
+        scopes: ['report:write'],
+        reason: 'agent wants to write the approved report'
+      }
+    })
+    if (decision.decision !== 'approved') {
+      throw new Error(`Report gate resolved as ${decision.decision}`)
+    }
+    await run.state.patch({
+      status: 'writing',
+      approvedBy: decision.actor
+    })
+  }
 
   const report = await run.step(
     'write-report',

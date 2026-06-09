@@ -47,10 +47,13 @@
     id: string
     name: string
     prompt: string
+    data: unknown
     status: string
     decision: string | null
     actor: string | null
+    decisionPayload: unknown
     capability: unknown
+    resolveToken: string
     createdAt: string
     resolvedAt: string | null
   }
@@ -114,8 +117,8 @@
       subtitle: 'Inspect replay boundaries, completed step outputs, and failed attempts.'
     },
     recovery: {
-      title: 'Recovery',
-      subtitle: 'See which webhook calls Tidebase made back into your app.'
+      title: 'Control',
+      subtitle: 'Resolve gates, inspect recovery, and audit outbound channel delivery.'
     },
     postgres: {
       title: 'Postgres',
@@ -237,8 +240,29 @@
     await navigator.clipboard?.writeText(text)
   }
 
+  async function resolveGate(gate: Gate, decision: 'approved' | 'rejected') {
+    if (!selectedRunId) return
+    await post(`/runs/${selectedRunId}/gates/${gate.id}/resolve`, {
+      token: gate.resolveToken,
+      decision,
+      actor: 'studio:local',
+      payload: { source: 'studio' }
+    })
+    await refreshRuns()
+  }
+
   async function get<T>(path: string): Promise<T> {
     const response = await fetch(`${API}${path}`)
+    if (!response.ok) throw new Error(await response.text())
+    return (await response.json()) as T
+  }
+
+  async function post<T>(path: string, body: unknown): Promise<T> {
+    const response = await fetch(`${API}${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body)
+    })
     if (!response.ok) throw new Error(await response.text())
     return (await response.json()) as T
   }
@@ -307,7 +331,7 @@
         <GitBranch size={17} /> Checkpoints
       </button>
       <button class:active={activeView === 'recovery'} class="nav-button" onclick={() => (activeView = 'recovery')}>
-        <RotateCcw size={17} /> Recovery
+        <RotateCcw size={17} /> Control
       </button>
       <button class:active={activeView === 'postgres'} class="nav-button" onclick={() => (activeView = 'postgres')}>
         <Database size={17} /> Postgres
@@ -442,7 +466,7 @@
       {:else if activeView === 'checkpoints'}
         {@render CheckpointsView(detail)}
       {:else if activeView === 'recovery'}
-        {@render RecoveryView(detail)}
+        {@render RecoveryView(detail, (gate, decision) => void resolveGate(gate, decision))}
       {:else}
         {@render PostgresView(API)}
       {/if}
@@ -453,7 +477,9 @@
 {#snippet statusIcon(status: string)}
   {#if status === 'completed'}
     <CheckCircle2 size={15} />
-  {:else if status === 'manual_review'}
+  {:else if status === 'approved'}
+    <CheckCircle2 size={15} />
+  {:else if status === 'manual_review' || status === 'rejected' || status === 'canceled'}
     <ShieldAlert size={15} />
   {:else if status === 'failed'}
     <XCircle size={15} />
@@ -670,7 +696,7 @@
   </section>
 {/snippet}
 
-{#snippet RecoveryView(detail: RunDetail | null)}
+{#snippet RecoveryView(detail: RunDetail | null, onResolve: (gate: Gate, decision: 'approved' | 'rejected') => void)}
   <section class="workspace">
     <div class="panel">
       <div class="panel-head">
@@ -726,10 +752,17 @@
             <span class="chip {gate.status === 'approved' ? 'completed' : gate.status === 'pending' ? 'running' : 'manual_review'}">
               {@render statusIcon(gate.status)}
             </span>
-            <div>
+            <div class="gate-copy">
               <strong>{gate.name}</strong>
               <div class="meta">{gate.status}{gate.actor ? ` / ${gate.actor}` : ''}</div>
+              <div class="subtle">{gate.prompt}</div>
             </div>
+            {#if gate.status === 'pending'}
+              <div class="step-actions">
+                <button class="button compact" onclick={() => onResolve(gate, 'approved')}>Approve</button>
+                <button class="button compact danger" onclick={() => onResolve(gate, 'rejected')}>Reject</button>
+              </div>
+            {/if}
           </div>
         {:else}
           {@render empty('No gates for this run.')}
@@ -784,7 +817,7 @@
         </div>
       </div>
       <div class="tab-body table-list">
-        {#each ['runs', 'steps', 'run_state', 'events', 'recovery_attempts'] as table}
+        {#each ['runs', 'steps', 'run_state', 'events', 'recovery_attempts', 'channels', 'channel_deliveries', 'gates'] as table}
           <div class="table-card mono">{table}</div>
         {/each}
       </div>

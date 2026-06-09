@@ -13,6 +13,7 @@
     "example": "pnpm --filter @tidebase/example-report dev",
     "preexample:webhook": "pnpm --filter @tidebase/sdk build",
     "example:webhook": "pnpm --filter @tidebase/example-report webhook",
+    "example:review": "pnpm --filter @tidebase/example-report review",
     "build": "pnpm -r build",
     "check": "pnpm --filter @tidebase/sdk build && pnpm -r check",
     "verify": "pnpm check && pnpm build"
