@@ -1,0 +1,44 @@
+/* ============================================================
+   Tidebase — Motion tokens
+   Calm with energetic punctuation. Mostly ease-out fades and
+   short translates; spring reserved for confirmations & toasts.
+   No infinite decorative loops except the live "running" pulse.
+   ============================================================ */
+
+:root {
+  /* Durations */
+  --dur-instant: 80ms;  /* @kind other */
+  --dur-fast:    140ms; /* @kind other */
+  --dur-base:    220ms; /* @kind other */
+  --dur-slow:    320ms; /* @kind other */
+  --dur-slower:  480ms; /* @kind other */
+
+  /* Easings */
+  --ease-out:    cubic-bezier(0.22, 0.8, 0.28, 1);   /* @kind other */
+  --ease-in-out: cubic-bezier(0.6, 0, 0.2, 1);       /* @kind other */
+  --ease-in:     cubic-bezier(0.5, 0, 0.9, 0.3);     /* @kind other */
+  --ease-spring: cubic-bezier(0.34, 1.42, 0.58, 1);  /* @kind other */
+
+  /* Composite transitions */
+  --transition-colors: color var(--dur-fast) var(--ease-out),
+                       background-color var(--dur-fast) var(--ease-out),
+                       border-color var(--dur-fast) var(--ease-out),
+                       box-shadow var(--dur-fast) var(--ease-out);
+  --transition-transform: transform var(--dur-base) var(--ease-out);
+  --transition-all: all var(--dur-base) var(--ease-out);
+}
+
+/* The single sanctioned looping animation: a live run's pulse. */
+@keyframes tb-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.35; }
+}
+
+@keyframes tb-spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes tb-fade-up {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}

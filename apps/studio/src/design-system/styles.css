@@ -1,0 +1,14 @@
+/* ============================================================
+   Tidebase Design System — global entry point
+   Consumers link THIS file. Import-only; no rules live here.
+   ============================================================ */
+
+@import "./tokens/fonts.css";
+@import "./tokens/colors.css";
+@import "./tokens/typography.css";
+@import "./tokens/type-roles.css";
+@import "./tokens/spacing.css";
+@import "./tokens/radius-shadow.css";
+@import "./tokens/glass.css";
+@import "./tokens/motion.css";
+@import "./tokens/base.css";

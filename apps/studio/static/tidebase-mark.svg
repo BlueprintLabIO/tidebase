@@ -1,0 +1,13 @@
+<svg width="40" height="40" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Tidebase">
+  <defs>
+    <linearGradient id="tb-mark" x1="4" y1="8" x2="36" y2="32" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#24c6da"></stop>
+      <stop offset="1" stop-color="#0a8a9e"></stop>
+    </linearGradient>
+  </defs>
+  <g stroke="url(#tb-mark)" stroke-width="3.6" stroke-linecap="round" fill="none">
+    <path d="M4 13 q 5 -5 10 0 t 10 0 t 10 0"></path>
+    <path d="M4 20 q 5 -5 10 0 t 10 0 t 10 0"></path>
+    <path d="M4 27 q 5 -5 10 0 t 10 0 t 10 0"></path>
+  </g>
+</svg>

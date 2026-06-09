@@ -1,0 +1,41 @@
+/* ============================================================
+   Tidebase — Radius, shadow & elevation tokens
+   Soft premium corners. Cool blue-tinted shadows (never neutral
+   black) so elevation reads as part of the oceanic palette.
+   ============================================================ */
+
+:root {
+  /* Corner radii */
+  --radius-xs:   4px;
+  --radius-sm:   6px;
+  --radius-md:   8px;
+  --radius-lg:   12px;
+  --radius-xl:   16px;
+  --radius-2xl:  20px;
+  --radius-3xl:  28px;
+  --radius-pill: 999px;
+
+  /* Component defaults */
+  --radius-button:  10px;
+  --radius-input:   9px;
+  --radius-card:    14px;
+  --radius-badge:   var(--radius-pill);
+
+  /* Shadows — tinted with deep navy (9,29,45) for cool elevation */
+  --shadow-xs:  0 1px 2px rgba(9, 29, 45, 0.06);
+  --shadow-sm:  0 1px 2px rgba(9, 29, 45, 0.06), 0 1px 3px rgba(9, 29, 45, 0.08);
+  --shadow-md:  0 2px 4px -1px rgba(9, 29, 45, 0.06), 0 6px 16px -4px rgba(9, 29, 45, 0.12);
+  --shadow-lg:  0 4px 8px -2px rgba(9, 29, 45, 0.08), 0 16px 32px -8px rgba(9, 29, 45, 0.16);
+  --shadow-xl:  0 8px 16px -4px rgba(9, 29, 45, 0.10), 0 28px 56px -12px rgba(9, 29, 45, 0.22);
+
+  /* Inset / inner */
+  --shadow-inset: inset 0 1px 2px rgba(9, 29, 45, 0.07);
+
+  /* Focus ring & brand glow */
+  --ring-brand: 0 0 0 3px var(--brand-ring);
+  --ring-danger: 0 0 0 3px color-mix(in oklch, var(--danger) 30%, transparent);
+  --glow-tide: 0 0 0 1px var(--tide-400), 0 6px 22px -6px color-mix(in oklch, var(--tide-500) 55%, transparent);
+
+  /* Hairline border helper (use as box-shadow for crisp 1px) */
+  --hairline: 0 0 0 1px var(--border-subtle);
+}

@@ -13,7 +13,6 @@
     Search,
     Server,
     ShieldAlert,
-    Waves,
     Webhook,
     XCircle
   } from '@lucide/svelte'
@@ -353,7 +352,7 @@
 <div class="studio">
   <aside class="sidebar">
     <div class="brand">
-      <span class="brand-mark"><Waves size={19} /></span>
+      <span class="brand-mark"><img src="/tidebase-mark.svg" alt="" /></span>
       <div>
         <strong>Tidebase</strong>
         <small>Studio</small>
@@ -455,17 +454,17 @@
 
             <table class="run-table">
               <colgroup>
-                <col style="width: 44%;" />
-                <col style="width: 24%;" />
-                <col style="width: 22%;" />
-                <col style="width: 10%;" />
+                <col style="width: 42%;" />
+                <col style="width: 23%;" />
+                <col style="width: 21%;" />
+                <col style="width: 14%;" />
               </colgroup>
               <thead>
                 <tr>
                   <th>Workflow</th>
                   <th>Status</th>
                   <th>Updated</th>
-                  <th>Attempt</th>
+                  <th>Try</th>
                 </tr>
               </thead>
               <tbody>

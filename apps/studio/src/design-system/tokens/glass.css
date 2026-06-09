@@ -1,0 +1,63 @@
+/* ============================================================
+   Tidebase — Glass (glassmorphism) tokens
+   "A glass of lemonade on the ocean." Frosted, floating,
+   pill-friendly translucent surfaces designed to sit over the
+   tide/abyss gradients or imagery — never over flat white.
+   Two families: --glass-* (light frost) and --glass-dark-*
+   (smoked, for use on bright/lemon backdrops).
+   ============================================================ */
+
+:root {
+  /* Blur strength */
+  --glass-blur:        16px;
+  --glass-blur-strong: 28px;
+  --glass-saturate:    140%;
+
+  /* Light frost — chilled glass, the default lemonade tumbler */
+  --glass-fill:        rgba(255, 255, 255, 0.14);
+  --glass-fill-hover:  rgba(255, 255, 255, 0.22);
+  --glass-fill-strong: rgba(255, 255, 255, 0.30);
+  --glass-border:      rgba(255, 255, 255, 0.40);
+  --glass-border-soft: rgba(255, 255, 255, 0.22);
+  --glass-text:        #ffffff;
+  --glass-text-muted:  rgba(255, 255, 255, 0.72);
+
+  /* A whisper of lemon in the glass — the lemonade tint */
+  --glass-lemon-fill:  color-mix(in oklch, var(--lemon-200) 16%, rgba(255,255,255,0.10));
+  --glass-lemon-edge:  color-mix(in oklch, var(--lemon-200) 55%, rgba(255,255,255,0.35));
+
+  /* Smoked glass — for placement on bright/lemon surfaces */
+  --glass-dark-fill:   rgba(7, 25, 43, 0.30);
+  --glass-dark-border: rgba(7, 25, 43, 0.16);
+  --glass-dark-text:   var(--abyss-900);
+
+  /* Floating elevation — soft, cool, lifted off the water.
+     Pair with the top inner highlight for a convex meniscus. */
+  --glass-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.35) inset,
+    0 8px 24px -8px rgba(6, 35, 52, 0.40),
+    0 2px 6px -2px rgba(6, 35, 52, 0.30);
+  --glass-shadow-lifted:
+    0 1px 0 rgba(255, 255, 255, 0.40) inset,
+    0 18px 48px -12px rgba(6, 35, 52, 0.55),
+    0 4px 12px -4px rgba(6, 35, 52, 0.35);
+
+  /* Highlight sweep used on the top edge of pills/tumblers */
+  --glass-sheen: linear-gradient(180deg, rgba(255,255,255,0.45) 0%, rgba(255,255,255,0) 42%); /* @kind other */
+}
+
+/* Reusable utility — anything can become floating glass.
+   Requires a colorful/gradient/image backdrop behind it to read. */
+.tb-glass {
+  background: var(--glass-fill);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  border: 1px solid var(--glass-border-soft);
+  box-shadow: var(--glass-shadow);
+  color: var(--glass-text);
+}
+.tb-glass--lemon {
+  background: var(--glass-lemon-fill);
+  border-color: var(--glass-lemon-edge);
+}
+.tb-glass--pill { border-radius: var(--radius-pill); }
