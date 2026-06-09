@@ -197,6 +197,34 @@ POST /runs/:runId/gates/:gateId/resolve
 
 Credential and capability fields are audit metadata only. Tidebase does not store or broker API keys in this alpha.
 
+## Usage Tracking
+
+Tidebase can record generic resource usage for a run without proxying model or provider calls:
+
+```typescript
+await run.usage.record({
+  kind: 'llm',
+  provider: 'openai',
+  model: 'gpt-4.1-mini',
+  label: 'draft-response',
+  inputTokens: 1200,
+  outputTokens: 420,
+  costUsd: 0.012
+})
+```
+
+Usage records are stored with the run, emitted as `usage.recorded` events, and summarized in Studio. The same ledger can track non-LLM resources:
+
+```typescript
+await run.usage.record({
+  kind: 'tool',
+  provider: 'internal-search',
+  quantity: 8,
+  unit: 'queries',
+  costUsd: 0.004
+})
+```
+
 ## Current Scope
 
 - Postgres-backed run store
@@ -207,6 +235,7 @@ Credential and capability fields are audit metadata only. Tidebase does not stor
 - webhook channels
 - durable gates
 - credential/capability audit metadata
+- generic usage/resource ledger for tokens, units, and cost
 - live state set/patch
 - append-only run events
 - SSE event stream

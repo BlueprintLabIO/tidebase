@@ -49,6 +49,21 @@ const stateSchema = z.object({
   value: z.unknown()
 })
 
+const usageSchema = z.object({
+  stepId: z.string().optional(),
+  kind: z.string().min(1).optional(),
+  provider: z.string().optional(),
+  model: z.string().optional(),
+  label: z.string().optional(),
+  quantity: z.number().optional(),
+  unit: z.string().optional(),
+  inputTokens: z.number().int().nonnegative().optional(),
+  outputTokens: z.number().int().nonnegative().optional(),
+  totalTokens: z.number().int().nonnegative().optional(),
+  costUsd: z.number().nonnegative().optional(),
+  metadata: jsonRecord.optional()
+})
+
 const gateBeginSchema = z.object({
   name: z.string().min(1),
   prompt: z.string().min(1),
@@ -122,7 +137,7 @@ export function createApp() {
 
   app.get('/runs/:runId', async (c) => {
     const runId = c.req.param('runId')
-    const [runResult, stepsResult, stateResult, recoveryResult, channelsResult, deliveriesResult, gatesResult, events] = await Promise.all([
+    const [runResult, stepsResult, stateResult, recoveryResult, channelsResult, deliveriesResult, gatesResult, usageResult, events] = await Promise.all([
       pool.query('select * from runs where id = $1', [runId]),
       pool.query('select * from steps where run_id = $1 order by created_at asc', [
         runId
@@ -138,6 +153,7 @@ export function createApp() {
         [runId]
       ),
       pool.query('select * from gates where run_id = $1 order by created_at asc', [runId]),
+      pool.query('select * from usage_records where run_id = $1 order by created_at asc', [runId]),
       listEvents(runId)
     ])
     if (!runResult.rows[0]) return c.json({ error: 'run not found' }, 404)
@@ -149,6 +165,7 @@ export function createApp() {
       channels: channelsResult.rows.map(mapChannel),
       channelDeliveries: deliveriesResult.rows.map(mapChannelDelivery),
       gates: gatesResult.rows.map(mapGate),
+      usage: usageResult.rows.map(mapUsageRecord),
       events
     })
   })
@@ -537,6 +554,40 @@ export function createApp() {
     return c.json({ state })
   })
 
+  app.post('/runs/:runId/usage', async (c) => {
+    const runId = c.req.param('runId')
+    const body = usageSchema.parse(await c.req.json())
+    const usage = await tx(async (client) => {
+      const result = await client.query(
+        `insert into usage_records
+          (run_id, step_id, kind, provider, model, label, quantity, unit, input_tokens, output_tokens, total_tokens, cost_usd, metadata_json)
+         values
+          ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+         returning *`,
+        [
+          runId,
+          body.stepId ?? null,
+          body.kind ?? 'custom',
+          body.provider ?? null,
+          body.model ?? null,
+          body.label ?? null,
+          body.quantity ?? null,
+          body.unit ?? null,
+          body.inputTokens ?? null,
+          body.outputTokens ?? null,
+          usageTotalTokens(body),
+          body.costUsd ?? null,
+          json(body.metadata ?? {})
+        ]
+      )
+      const record = mapUsageRecord(result.rows[0])
+      await appendEvent(client, runId, 'usage.recorded', { usage: record })
+      await deliverChannels(client, runId, 'usage.recorded', { usage: record })
+      return record
+    })
+    return c.json({ usage })
+  })
+
   app.get('/runs/:runId/events', async (c) => {
     const runId = c.req.param('runId')
     const after = Number(c.req.query('after') ?? 0)
@@ -876,6 +927,32 @@ function mapChannelDelivery(row: Record<string, any>) {
     errorText: row.error_text as string | null,
     createdAt: row.created_at.toISOString(),
     completedAt: row.completed_at?.toISOString?.() ?? null
+  }
+}
+
+function usageTotalTokens(body: z.infer<typeof usageSchema>) {
+  if (body.totalTokens != null) return body.totalTokens
+  if (body.inputTokens == null && body.outputTokens == null) return null
+  return (body.inputTokens ?? 0) + (body.outputTokens ?? 0)
+}
+
+function mapUsageRecord(row: Record<string, any>) {
+  return {
+    id: row.id as string,
+    runId: row.run_id as string,
+    stepId: row.step_id as string | null,
+    kind: row.kind as string,
+    provider: row.provider as string | null,
+    model: row.model as string | null,
+    label: row.label as string | null,
+    quantity: row.quantity == null ? null : Number(row.quantity),
+    unit: row.unit as string | null,
+    inputTokens: row.input_tokens as number | null,
+    outputTokens: row.output_tokens as number | null,
+    totalTokens: row.total_tokens as number | null,
+    costUsd: row.cost_usd == null ? null : Number(row.cost_usd),
+    metadata: row.metadata_json,
+    createdAt: row.created_at.toISOString()
   }
 }
 

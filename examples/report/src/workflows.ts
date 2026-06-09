@@ -6,6 +6,15 @@ export const researchReport: TideWorkflow<{ topic: string }, { report: string }>
 ) => {
   const plan = await run.step('plan', { input: { topic: input.topic } }, async () => {
     await delay(250)
+    await run.usage.record({
+      kind: 'llm',
+      provider: 'example',
+      model: 'planner-mock',
+      label: 'plan',
+      inputTokens: 180,
+      outputTokens: 120,
+      costUsd: 0.003
+    })
     return {
       sections: ['problem', 'current workaround', 'recommended shape'],
       topic: input.topic
@@ -22,6 +31,14 @@ export const researchReport: TideWorkflow<{ topic: string }, { report: string }>
     },
     async () => {
       await delay(250)
+      await run.usage.record({
+        kind: 'tool',
+        provider: 'example',
+        label: 'fetch-sources',
+        quantity: 3,
+        unit: 'sources',
+        costUsd: 0.001
+      })
       return [
         'teams need checkpointed multi-step workflows',
         'retries must not duplicate completed external work',
@@ -84,6 +101,15 @@ export const researchReport: TideWorkflow<{ topic: string }, { report: string }>
       if (process.env.FAIL_WRITE === '1') {
         throw new Error('Simulated write failure after plan and fetch checkpoints')
       }
+      await run.usage.record({
+        kind: 'llm',
+        provider: 'example',
+        model: 'writer-mock',
+        label: 'write-report',
+        inputTokens: 420,
+        outputTokens: 260,
+        costUsd: 0.007
+      })
       return [
         `Report: ${input.topic}`,
         '',

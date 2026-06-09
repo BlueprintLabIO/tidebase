@@ -109,6 +109,21 @@ export type GateDecision = {
   payload: unknown
 }
 
+export type UsageRecordOptions = {
+  stepId?: string
+  kind?: string
+  provider?: string
+  model?: string
+  label?: string
+  quantity?: number
+  unit?: string
+  inputTokens?: number
+  outputTokens?: number
+  totalTokens?: number
+  costUsd?: number
+  metadata?: Record<string, unknown>
+}
+
 export type WebhookOptions = {
   secret?: string
 }
@@ -316,6 +331,7 @@ export class RunsClient {
 
 export class RunContext {
   readonly state: RunState
+  readonly usage: RunUsage
 
   constructor(
     private readonly client: Tidebase,
@@ -323,6 +339,7 @@ export class RunContext {
     private readonly leaseOwner: string
   ) {
     this.state = new RunState(client, runId)
+    this.usage = new RunUsage(client, runId)
   }
 
   async step<TResult>(
@@ -476,6 +493,20 @@ function classifyResumeDecision(options: StepOptions) {
     return 'manual_review'
   }
   return 'fail_hard'
+}
+
+export class RunUsage {
+  constructor(
+    private readonly client: Tidebase,
+    private readonly runId: string
+  ) {}
+
+  async record(options: UsageRecordOptions) {
+    return this.client.request(`/runs/${this.runId}/usage`, {
+      method: 'POST',
+      body: JSON.stringify(options)
+    })
+  }
 }
 
 export class RunState {

@@ -21,6 +21,7 @@
   const API = import.meta.env.VITE_TIDEBASE_API ?? 'http://localhost:7373'
 
   type ConsoleView = 'runs' | 'checkpoints' | 'recovery' | 'postgres'
+  type RunTab = 'steps' | 'state' | 'usage' | 'recovery' | 'events'
   type RunStatus = 'created' | 'running' | 'completed' | 'failed' | string
 
   type Run = {
@@ -67,6 +68,21 @@
     createdAt: string
   }
 
+  type UsageRecord = {
+    id: string
+    kind: string
+    provider: string | null
+    model: string | null
+    label: string | null
+    quantity: number | null
+    unit: string | null
+    inputTokens: number | null
+    outputTokens: number | null
+    totalTokens: number | null
+    costUsd: number | null
+    createdAt: string
+  }
+
   type ResumeContract = {
     sideEffects: string[]
     idempotencyKey: string | null
@@ -104,6 +120,7 @@
     recoveryAttempts: RecoveryAttempt[]
     channelDeliveries: ChannelDelivery[]
     gates: Gate[]
+    usage: UsageRecord[]
     events: RunEvent[]
   }
 
@@ -127,7 +144,7 @@
   }
 
   let activeView = $state<ConsoleView>('runs')
-  let selectedTab = $state<'steps' | 'state' | 'recovery' | 'events'>('steps')
+  let selectedTab = $state<RunTab>('steps')
   let selectedRunId = $state<string | null>(null)
   let query = $state('')
   let streamState = $state<'idle' | 'connected' | 'disconnected'>('idle')
@@ -175,6 +192,18 @@
   const failedSteps = $derived(detail?.steps.filter((step) => step.status.includes('failed') || step.status === 'manual_review').length ?? 0)
   const latestError = $derived(
     detail?.steps.find((step) => step.status.includes('failed') || step.status === 'manual_review')?.error ?? detail?.run.error ?? null
+  )
+  const usageTotals = $derived.by(() =>
+    (detail?.usage ?? []).reduce(
+      (result, usage) => {
+        result.inputTokens += usage.inputTokens ?? 0
+        result.outputTokens += usage.outputTokens ?? 0
+        result.totalTokens += usage.totalTokens ?? 0
+        result.costUsd += usage.costUsd ?? 0
+        return result
+      },
+      { inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0 }
+    )
   )
   const loadingError = $derived(
     runsQuery.error instanceof Error
@@ -305,6 +334,15 @@
           : 'credential'
       )
       .join(', ')
+  }
+
+  function formatCost(value: number | null | undefined) {
+    if (!value) return '$0.0000'
+    return `$${value.toFixed(4)}`
+  }
+
+  function formatNumber(value: number | null | undefined) {
+    return new Intl.NumberFormat().format(value ?? 0)
   }
 </script>
 
@@ -459,6 +497,7 @@
             failedSteps,
             latestError,
             streamState,
+            usageTotals,
             onTab: (tab) => (selectedTab = tab),
             onCopy: (text) => void copy(text)
           })}
@@ -517,12 +556,13 @@
 {#snippet RunInspector(props: {
   detail: RunDetail | null
   selectedRun: Run | null
-  selectedTab: 'steps' | 'state' | 'recovery' | 'events'
+  selectedTab: RunTab
   completedSteps: number
   failedSteps: number
   latestError: unknown
   streamState: string
-  onTab: (tab: 'steps' | 'state' | 'recovery' | 'events') => void
+  usageTotals: { inputTokens: number; outputTokens: number; totalTokens: number; costUsd: number }
+  onTab: (tab: RunTab) => void
   onCopy: (text: string) => void
 })}
   <section class="panel">
@@ -548,6 +588,7 @@
           {@render fact('Attempt', String(props.selectedRun.attempt ?? 0))}
           {@render fact('Updated', formatTime(props.selectedRun.updatedAt))}
           {@render fact('Checkpoints', `${props.completedSteps}/${props.detail?.steps.length ?? 0}`)}
+          {@render fact('Cost', formatCost(props.usageTotals.costUsd))}
         </div>
         {#if props.latestError}
           <div class="step-card">
@@ -559,8 +600,8 @@
       </div>
 
       <div class="tabs">
-        {#each ['steps', 'state', 'recovery', 'events'] as tab}
-          <button class:active={props.selectedTab === tab} class="tab" onclick={() => props.onTab(tab as 'steps' | 'state' | 'recovery' | 'events')}>
+        {#each ['steps', 'state', 'usage', 'recovery', 'events'] as tab}
+          <button class:active={props.selectedTab === tab} class="tab" onclick={() => props.onTab(tab as RunTab)}>
             {tab}
           </button>
         {/each}
@@ -621,6 +662,43 @@
           </div>
         {:else if props.selectedTab === 'state'}
           {@render code(props.detail?.state?.value ?? {})}
+        {:else if props.selectedTab === 'usage'}
+          <div class="usage-summary">
+            <div class="fact">
+              <span class="meta">Input tokens</span>
+              <strong>{formatNumber(props.usageTotals.inputTokens)}</strong>
+            </div>
+            <div class="fact">
+              <span class="meta">Output tokens</span>
+              <strong>{formatNumber(props.usageTotals.outputTokens)}</strong>
+            </div>
+            <div class="fact">
+              <span class="meta">Total tokens</span>
+              <strong>{formatNumber(props.usageTotals.totalTokens)}</strong>
+            </div>
+            <div class="fact">
+              <span class="meta">Cost</span>
+              <strong>{formatCost(props.usageTotals.costUsd)}</strong>
+            </div>
+          </div>
+          <div class="attempt-list usage-list">
+            {#each props.detail?.usage ?? [] as usage}
+              <div class="attempt-card">
+                <span class="badge">{usage.kind}</span>
+                <div>
+                  <strong>{usage.label ?? usage.provider ?? 'usage'}</strong>
+                  <div class="meta">
+                    {usage.provider ?? 'custom'}{usage.model ? ` / ${usage.model}` : ''}
+                    {usage.totalTokens ? ` / ${formatNumber(usage.totalTokens)} tokens` : ''}
+                    {usage.quantity ? ` / ${formatNumber(usage.quantity)} ${usage.unit ?? 'units'}` : ''}
+                    {usage.costUsd ? ` / ${formatCost(usage.costUsd)}` : ''}
+                  </div>
+                </div>
+              </div>
+            {:else}
+              {@render empty('No usage records for this run.')}
+            {/each}
+          </div>
         {:else if props.selectedTab === 'recovery'}
           <div class="attempt-list">
             {#each props.detail?.recoveryAttempts ?? [] as attempt}

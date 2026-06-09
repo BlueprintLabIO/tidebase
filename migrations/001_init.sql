@@ -110,6 +110,24 @@ create table if not exists gates (
   unique (run_id, name)
 );
 
+create table if not exists usage_records (
+  id text primary key default ('use_' || replace(gen_random_uuid()::text, '-', '')),
+  run_id text not null references runs(id) on delete cascade,
+  step_id text references steps(id) on delete set null,
+  kind text not null default 'custom',
+  provider text,
+  model text,
+  label text,
+  quantity numeric,
+  unit text,
+  input_tokens integer,
+  output_tokens integer,
+  total_tokens integer,
+  cost_usd numeric,
+  metadata_json jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+
 create index if not exists runs_status_idx on runs(status);
 create index if not exists steps_run_id_idx on steps(run_id);
 create index if not exists events_run_id_seq_idx on events(run_id, seq);
@@ -118,3 +136,4 @@ create index if not exists channels_run_id_idx on channels(run_id);
 create index if not exists channel_deliveries_run_id_idx on channel_deliveries(run_id);
 create index if not exists gates_run_id_idx on gates(run_id);
 create index if not exists gates_status_idx on gates(status);
+create index if not exists usage_records_run_id_idx on usage_records(run_id);

@@ -582,7 +582,7 @@ h2 {
 .facts {
   display: grid;
   gap: 10px;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
 }
 
 .fact {
@@ -636,6 +636,13 @@ h2 {
 .table-list {
   display: grid;
   gap: 13px;
+}
+
+.usage-summary {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin-bottom: 13px;
 }
 
 .step-row {
@@ -765,6 +772,7 @@ h2 {
   .metrics,
   .workspace,
   .facts,
+  .usage-summary,
   .contract-grid {
     grid-template-columns: 1fr;
   }
