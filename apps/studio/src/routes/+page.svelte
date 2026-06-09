@@ -355,11 +355,18 @@
       <span class="brand-mark"><img src="/tidebase-mark.svg" alt="" /></span>
       <div>
         <strong>Tidebase</strong>
-        <small>Studio</small>
       </div>
     </div>
 
-    <div class="nav-label">Console</div>
+    <div class="server-status">
+      <span class="project-dot"></span>
+      <div>
+        <strong>Local alpha</strong>
+        <span>{API.replace(/^https?:\/\//, '')}</span>
+      </div>
+    </div>
+
+    <div class="nav-label">Workspace</div>
     <nav class="nav" aria-label="Studio views">
       <button class:active={activeView === 'runs'} class="nav-button" onclick={() => (activeView = 'runs')}>
         <Activity size={17} /> Runs
@@ -374,16 +381,6 @@
         <Database size={17} /> Postgres
       </button>
     </nav>
-
-    <div class="sidebar-footer">
-      <div class="server-status">
-        <Server size={17} />
-        <div>
-          <strong>Local alpha</strong>
-          <span>{API.replace(/^https?:\/\//, '')}</span>
-        </div>
-      </div>
-    </div>
   </aside>
 
   <section class="main">

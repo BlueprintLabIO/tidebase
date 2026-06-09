@@ -1,8 +1,52 @@
-# Tidebase Alpha
+<p align="center">
+  <img src="apps/studio/static/tidebase-mark.svg" alt="Tidebase" width="56" height="56" />
+</p>
 
-Tidebase is a self-hosted run backend for checkpointed agent workflows.
+<h1 align="center">Tidebase</h1>
 
-Your code still runs in your app, worker, or job process. Tidebase stores run checkpoints, state, and events in Postgres so a rerun can skip completed steps and continue from the first incomplete step.
+<p align="center">
+  Checkpointed runs, live state, gates, and usage tracking for existing agent workflows.
+</p>
+
+<p align="center">
+  <a href="#quick-start">Quick start</a>
+  ·
+  <a href="#api-shape">API</a>
+  ·
+  <a href="#what-tidebase-stores">Storage contract</a>
+  ·
+  <a href="#current-scope">Scope</a>
+</p>
+
+![Tidebase Studio](docs/assets/dashboard-shot.png)
+
+<!--
+Demo video:
+Export the product film from the design-system video composition, upload the mp4/webm
+to a GitHub issue, release, or README edit, then paste the generated URL here.
+GitHub renders user-attachments video URLs as an embedded player.
+
+Example:
+https://github.com/user-attachments/assets/...
+-->
+
+Tidebase is a self-hosted run backend for long-running agent workflows.
+
+Your code still runs in your app, worker, or job process. Tidebase stores checkpoints, state, events, gates, channel deliveries, recovery attempts, and usage records in Postgres so failed runs can resume from the last safe point without moving execution into a hosted runtime.
+
+## Why Tidebase
+
+Agent products usually grow the same operational plumbing:
+
+- status tables for runs and steps
+- checkpoint blobs for partial progress
+- retry flags and manual-review states
+- progress streaming to the UI
+- approval gates for risky actions
+- token and cost ledgers
+- webhook glue for recovery and external review surfaces
+
+Tidebase packages that layer around your existing code. It is not an LLM proxy, queue, hosted worker runtime, or secret broker.
 
 ## Quick Start
 
@@ -27,7 +71,7 @@ pnpm dev
 - Server: http://localhost:7373
 - Studio: http://localhost:5173
 
-Run the dogfood workflow:
+Run the example workflow:
 
 ```bash
 pnpm example
@@ -46,58 +90,6 @@ TIDEBASE_RUN_ID=run_xxx pnpm example
 ```
 
 The `plan` and `fetch-sources` steps are returned from checkpoints. Only `write-report` executes again.
-
-Run a local approval channel:
-
-```bash
-pnpm example:review
-```
-
-In another terminal, start a workflow that waits for approval:
-
-```bash
-REQUIRE_APPROVAL=1 \
-TIDEBASE_CHANNEL_WEBHOOK=http://localhost:8788/tidebase-events \
-pnpm example
-```
-
-Open http://localhost:8788, approve the gate, and the workflow continues. Studio shows the pending gate, channel delivery, decision actor, resume contracts, and final run timeline.
-
-## Recovery Webhooks
-
-Tidebase can call back into your app when a run fails and has a recovery webhook configured. The SDK can handle that webhook and resume the matching workflow.
-
-Register workflows and expose the handler:
-
-```typescript
-import { Tidebase } from '@tidebase/sdk'
-
-const tide = new Tidebase()
-
-tide.workflow('generate-report', async (run, input) => {
-  const plan = await run.step('plan', () => makePlan(input))
-  return run.step('write-report', () => writeReport(plan))
-})
-
-export const POST = tide.webhook()
-```
-
-Create a run with a recovery webhook:
-
-```typescript
-const run = await tide.runs.create('generate-report', {
-  input: { topic: 'checkpoints' },
-  recoveryWebhook: 'https://your-app.example.com/api/tidebase'
-})
-```
-
-Tidebase records each recovery attempt with delivery status, HTTP status, response body, and errors. If `TIDEBASE_WEBHOOK_SECRET` is set on both the server and SDK, recovery payloads are signed with `x-tidebase-signature`.
-
-The example includes a local webhook server:
-
-```bash
-pnpm example:webhook
-```
 
 ## API Shape
 
@@ -137,15 +129,15 @@ await run.step(
 )
 ```
 
-The alpha stores this contract with the step, shows it in Studio, and records it in step events. Final step failures are classified as:
+Tidebase records that contract with the step and shows it in Studio. Final step failures are classified as:
 
-- `failed_retryable` when the SDK still has retries left.
-- `manual_review` when replay is declared as manual, or when external side effects are present without an idempotency key.
+- `failed_retryable` when SDK retries remain.
+- `manual_review` when replay is manual, or when side effects exist without an idempotency key.
 - `failed` for hard failures.
 
 This does not make external systems exactly-once. It makes the resume decision explicit instead of hiding it in logs and custom retry flags.
 
-## Channels And Gates
+## Gates And Channels
 
 Channels deliver Tidebase events to external surfaces. The alpha supports webhook channels:
 
@@ -164,7 +156,7 @@ await tide.run(
 )
 ```
 
-Gates create durable decisions that can be resolved by a product UI, Slack/Teams adapter, internal tool, local review page, or Studio fallback:
+Gates create durable approval decisions that can be resolved by Studio, a product UI, Slack/Teams adapter, internal tool, or local review page:
 
 ```typescript
 const decision = await run.gate('approve-send', {
@@ -183,19 +175,42 @@ if (decision.decision !== 'approved') {
 }
 ```
 
-Webhook gate payloads include `resolveUrl` and `resolveToken`. An adapter resolves the gate by posting:
+Webhook gate payloads include a `resolveUrl` and `resolveToken`. Credential and capability fields are audit metadata only; Tidebase does not store or broker API keys in this alpha.
 
-```http
-POST /runs/:runId/gates/:gateId/resolve
-{
-  "token": "resolve_token",
-  "decision": "approved",
-  "actor": "slack:U123",
-  "payload": { "comment": "looks good" }
-}
+Run a local approval channel:
+
+```bash
+pnpm example:review
 ```
 
-Credential and capability fields are audit metadata only. Tidebase does not store or broker API keys in this alpha.
+In another terminal:
+
+```bash
+REQUIRE_APPROVAL=1 \
+TIDEBASE_CHANNEL_WEBHOOK=http://localhost:8788/tidebase-events \
+pnpm example
+```
+
+Open http://localhost:8788, approve the gate, and the workflow continues.
+
+## Recovery Webhooks
+
+Tidebase can call back into your app when a run fails and has a recovery webhook configured. The SDK can handle that webhook and resume the matching workflow.
+
+```typescript
+const run = await tide.runs.create('generate-report', {
+  input: { topic: 'checkpoints' },
+  recoveryWebhook: 'https://your-app.example.com/api/tidebase'
+})
+```
+
+Tidebase records each recovery attempt with delivery status, HTTP status, response body, and errors. If `TIDEBASE_WEBHOOK_SECRET` is set on both the server and SDK, recovery payloads are signed with `x-tidebase-signature`.
+
+The example includes a local webhook server:
+
+```bash
+pnpm example:webhook
+```
 
 ## Usage Tracking
 
@@ -225,23 +240,33 @@ await run.usage.record({
 })
 ```
 
+## What Tidebase Stores
+
+- runs and attempts
+- named checkpointed steps
+- input hashes to prevent stale checkpoint reuse
+- step resume contracts
+- live state snapshots
+- append-only run events
+- recovery attempts
+- webhook channel deliveries
+- durable gates and decisions
+- credential/capability audit metadata
+- generic usage records for tokens, units, and cost
+
+Everything is backed by Postgres and designed for self-hosting from day one.
+
 ## Current Scope
 
 - Postgres-backed run store
-- named checkpointed steps
-- run and step leases
-- input-hash checks to prevent stale checkpoint reuse
-- step resume contracts for side effects, idempotency keys, replay policy, and checkpoint invariants
-- webhook channels
-- durable gates
-- credential/capability audit metadata
-- generic usage/resource ledger for tokens, units, and cost
+- TypeScript SDK
+- SvelteKit Studio
 - live state set/patch
-- append-only run events
 - SSE event stream
 - signed recovery webhooks
-- TypeScript SDK
-- Studio run timeline
+- webhook channels
+- durable gates
+- usage/resource ledger
 - dogfood workflow
 
 ## Not In This Alpha
@@ -250,7 +275,7 @@ await run.usage.record({
 - queues or worker deployment
 - LLM gateway/proxying
 - hosted channel adapters
-- secret custody / credential brokering
+- secret custody or credential brokering
 - memory
 - auth
 - hosted cloud

@@ -13,10 +13,7 @@
 body {
   margin: 0;
   min-width: 320px;
-  background:
-    radial-gradient(circle at 92% -12%, color-mix(in oklch, var(--tide-200) 42%, transparent), transparent 28rem),
-    radial-gradient(circle at 8% 102%, color-mix(in oklch, var(--lemon-100) 58%, transparent), transparent 25rem),
-    linear-gradient(180deg, var(--surface-app), var(--ink-0) 58%, var(--ink-50));
+  background: var(--surface-app);
 }
 
 button,
@@ -38,18 +35,17 @@ p {
 
 .studio {
   display: grid;
-  grid-template-columns: 268px minmax(0, 1fr);
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
   min-height: 100vh;
 }
 
 .sidebar {
-  background:
-    linear-gradient(180deg, color-mix(in oklch, var(--tide-50) 68%, transparent), transparent 32%),
-    var(--surface-card);
+  background: var(--surface-card);
   border-right: 1px solid var(--border-subtle);
   color: var(--text-body);
   display: flex;
   flex-direction: column;
+  gap: var(--space-4);
   min-height: 100vh;
   padding: var(--space-4) var(--space-3);
   position: sticky;
@@ -59,9 +55,8 @@ p {
 .brand {
   align-items: center;
   display: flex;
-  gap: var(--space-3);
-  margin-bottom: var(--space-7);
-  padding: 6px 8px;
+  gap: 9px;
+  padding: 6px 8px 0;
 }
 
 .brand-mark,
@@ -73,18 +68,17 @@ p {
 }
 
 .brand-mark {
-  background: var(--surface-card);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-xs);
-  height: 38px;
-  width: 38px;
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  height: 25px;
+  width: 25px;
 }
 
 .brand-mark img {
   display: block;
-  height: 23px;
-  width: 23px;
+  height: 25px;
+  width: 25px;
 }
 
 .brand strong {
@@ -92,13 +86,7 @@ p {
   display: block;
   font-size: var(--text-lg);
   font-weight: var(--weight-semibold);
-  letter-spacing: var(--tracking-tight);
-}
-
-.brand small {
-  color: var(--text-muted);
-  font-family: var(--font-mono);
-  font-size: var(--text-2xs);
+  letter-spacing: var(--tracking-tighter);
 }
 
 .nav-label,
@@ -113,14 +101,14 @@ p {
   font-family: var(--font-mono);
   font-size: var(--text-2xs);
   font-weight: var(--weight-medium);
-  letter-spacing: var(--tracking-caps);
-  margin: 0 8px 9px;
+  letter-spacing: 0.08em;
+  margin: 0 10px -8px;
   text-transform: uppercase;
 }
 
 .nav {
   display: grid;
-  gap: 3px;
+  gap: 2px;
 }
 
 .nav-button {
@@ -131,7 +119,9 @@ p {
   color: var(--text-muted);
   display: flex;
   gap: 11px;
-  min-height: 40px;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  height: 38px;
   padding: 0 11px;
   text-align: left;
   transition: var(--transition-colors), transform var(--dur-fast) var(--ease-out);
@@ -145,17 +135,12 @@ p {
 
 .nav-button.active {
   background: var(--brand-subtle);
-  border-color: color-mix(in oklch, var(--border-brand) 44%, transparent);
+  border-color: transparent;
   color: var(--brand-subtle-fg);
-  font-weight: var(--weight-semibold);
 }
 
 .nav-button.active svg {
   color: var(--brand);
-}
-
-.sidebar-footer {
-  margin-top: auto;
 }
 
 .server-status {
@@ -163,16 +148,20 @@ p {
   background: var(--surface-sunken);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-xs);
   color: var(--text-body);
   display: flex;
-  gap: var(--space-3);
-  min-height: 56px;
-  padding: var(--space-3);
+  gap: 10px;
+  padding: 9px 11px;
+  text-align: left;
 }
 
-.server-status svg {
-  color: var(--brand);
+.project-dot {
+  background: var(--success);
+  border-radius: 999px;
+  box-shadow: 0 0 0 3px var(--success-subtle);
+  flex: none;
+  height: 8px;
+  width: 8px;
 }
 
 .server-status strong,
@@ -199,13 +188,13 @@ p {
 
 .topbar {
   align-items: center;
-  background: color-mix(in oklch, var(--ink-0) 78%, transparent);
+  background: rgba(255, 255, 255, 0.72);
   border-bottom: 1px solid var(--border-subtle);
   display: flex;
   gap: var(--space-5);
   justify-content: space-between;
   min-height: 78px;
-  padding: 15px 30px;
+  padding: 14px 28px;
   position: sticky;
   top: 0;
   z-index: 5;
@@ -215,9 +204,10 @@ p {
 
 .topbar h1 {
   color: var(--text-strong);
-  font-size: var(--text-2xl);
+  font-size: var(--text-lg);
   font-weight: var(--weight-semibold);
-  line-height: var(--leading-none);
+  letter-spacing: var(--tracking-tight);
+  line-height: var(--leading-tight);
 }
 
 .topbar p {
@@ -283,37 +273,27 @@ p {
 
 .content {
   display: grid;
-  gap: var(--space-5);
+  gap: 18px;
   margin: 0 auto;
-  max-width: 1440px;
-  padding: 24px 30px 48px;
+  max-width: 1180px;
+  padding: 26px 28px 60px;
 }
 
 .metrics {
   display: grid;
-  gap: var(--space-4);
+  gap: 14px;
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
 .card,
 .panel {
-  background: color-mix(in oklch, var(--surface-card) 92%, transparent);
+  background: var(--surface-card);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-card);
-  box-shadow: var(--shadow-sm);
+  box-shadow: var(--shadow-xs);
   min-width: 0;
   overflow: hidden;
   position: relative;
-}
-
-.card::before,
-.panel::before {
-  background: linear-gradient(90deg, var(--brand), color-mix(in oklch, var(--lemon-300) 76%, transparent), transparent 54%);
-  content: "";
-  height: 2px;
-  inset: 0 0 auto;
-  opacity: 0.78;
-  position: absolute;
 }
 
 .metric-card {
@@ -321,25 +301,25 @@ p {
   display: grid;
   gap: var(--space-4);
   grid-template-columns: minmax(0, 1fr) auto;
-  min-height: 124px;
-  padding: 17px;
+  min-height: 136px;
+  padding: 15px 16px;
 }
 
 .metric-card strong {
   color: var(--text-strong);
   display: block;
   font-family: var(--font-mono);
-  font-size: var(--text-3xl);
-  font-weight: var(--weight-semibold);
+  font-size: var(--text-2xl);
+  font-weight: var(--weight-medium);
   line-height: var(--leading-none);
-  margin: 10px 0 12px;
+  margin: 8px 0;
 }
 
 .metric-card p,
 .panel-head p,
 .empty {
   color: var(--text-muted);
-  font-size: var(--text-sm);
+  font-size: var(--text-xs);
 }
 
 .icon-box {
@@ -353,8 +333,8 @@ p {
 
 .workspace {
   display: grid;
-  gap: var(--space-5);
-  grid-template-columns: minmax(460px, 0.88fr) minmax(0, 1.4fr);
+  gap: 16px;
+  grid-template-columns: minmax(420px, 0.92fr) minmax(0, 1.08fr);
 }
 
 .panel-head {
@@ -363,14 +343,15 @@ p {
   display: flex;
   gap: var(--space-4);
   justify-content: space-between;
-  padding: 17px;
+  padding: 16px 18px 12px;
 }
 
 .panel-head h2,
 .panel-head h3 {
   color: var(--text-strong);
-  font-size: var(--text-xl);
+  font-size: var(--text-lg);
   font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-tight);
 }
 
 .search {
@@ -402,7 +383,7 @@ p {
 .run-table td {
   border-bottom: 1px solid var(--divider);
   overflow: hidden;
-  padding: 12px 10px;
+  padding: 10px 10px;
   text-align: left;
   text-overflow: ellipsis;
   vertical-align: middle;
@@ -413,7 +394,7 @@ p {
   font-family: var(--font-mono);
   font-size: var(--text-2xs);
   font-weight: var(--weight-medium);
-  letter-spacing: var(--tracking-caps);
+  letter-spacing: 0.06em;
   text-transform: uppercase;
 }
 
@@ -519,7 +500,7 @@ p {
   border-bottom: 1px solid var(--divider);
   display: grid;
   gap: var(--space-4);
-  padding: 20px;
+  padding: 18px 20px;
 }
 
 .detail-title {
@@ -532,7 +513,7 @@ p {
 
 .detail-title h2 {
   color: var(--text-strong);
-  font-size: var(--text-3xl);
+  font-size: var(--text-2xl);
   font-weight: var(--weight-semibold);
   line-height: var(--leading-tight);
 }
@@ -549,7 +530,7 @@ p {
   border-radius: var(--radius-md);
   display: grid;
   gap: 7px;
-  min-height: 73px;
+  min-height: 64px;
   padding: 11px;
 }
 
@@ -563,7 +544,7 @@ p {
   border-bottom: 1px solid var(--divider);
   display: flex;
   gap: 5px;
-  padding: 12px 17px;
+  padding: 10px 17px;
 }
 
 .tab {
@@ -571,7 +552,8 @@ p {
   border: 1px solid transparent;
   border-radius: var(--radius-md);
   color: var(--text-muted);
-  font-weight: var(--weight-semibold);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
   min-height: 34px;
   padding: 0 11px;
   text-transform: lowercase;
@@ -590,7 +572,7 @@ p {
 }
 
 .tab-body {
-  padding: 20px;
+  padding: 18px;
 }
 
 .step-list,
@@ -635,12 +617,12 @@ p {
 .table-card {
   background: var(--surface-card);
   border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-card);
   padding: 13px;
 }
 
 .step-card {
-  box-shadow: inset 3px 0 0 color-mix(in oklch, var(--brand) 18%, transparent);
+  box-shadow: none;
 }
 
 .step-top,
