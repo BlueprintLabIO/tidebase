@@ -43,6 +43,27 @@
     error: unknown
   }
 
+  type Gate = {
+    id: string
+    name: string
+    prompt: string
+    status: string
+    decision: string | null
+    actor: string | null
+    capability: unknown
+    createdAt: string
+    resolvedAt: string | null
+  }
+
+  type ChannelDelivery = {
+    id: string
+    eventType: string
+    status: string
+    httpStatus: number | null
+    errorText: string | null
+    createdAt: string
+  }
+
   type ResumeContract = {
     sideEffects: string[]
     idempotencyKey: string | null
@@ -78,6 +99,8 @@
     steps: Step[]
     state: { value: unknown; version: number } | null
     recoveryAttempts: RecoveryAttempt[]
+    channelDeliveries: ChannelDelivery[]
+    gates: Gate[]
     events: RunEvent[]
   }
 
@@ -244,6 +267,20 @@
   function sideEffectLabel(contract?: ResumeContract) {
     if (!contract?.sideEffects.length) return 'no side effects'
     return contract.sideEffects.join(', ')
+  }
+
+  function credentialLabel(contract?: ResumeContract) {
+    const credentials = Array.isArray((contract as ResumeContract & { credentials?: unknown[] } | undefined)?.credentials)
+      ? ((contract as ResumeContract & { credentials?: unknown[] }).credentials ?? [])
+      : []
+    if (!credentials.length) return '-'
+    return credentials
+      .map((credential) =>
+        credential && typeof credential === 'object' && 'name' in credential
+          ? String((credential as { name: unknown }).name)
+          : 'credential'
+      )
+      .join(', ')
   }
 </script>
 
@@ -544,6 +581,10 @@
                             : '-'}
                       </strong>
                     </div>
+                    <div>
+                      <span class="meta">Credentials</span>
+                      <strong class="truncate">{credentialLabel(step.resumeContract)}</strong>
+                    </div>
                   </div>
                   {#if step.error}
                     <div style="margin-top: 10px;">{@render code(step.error)}</div>
@@ -640,7 +681,13 @@
         <Webhook size={19} />
       </div>
       <div class="tab-body">
-        {@render code({ runId: detail?.run.id, webhook: detail?.run.recoveryWebhook, attempts: detail?.recoveryAttempts.length ?? 0 })}
+        {@render code({
+          runId: detail?.run.id,
+          webhook: detail?.run.recoveryWebhook,
+          attempts: detail?.recoveryAttempts.length ?? 0,
+          gates: detail?.gates.length ?? 0,
+          channelDeliveries: detail?.channelDeliveries.length ?? 0
+        })}
       </div>
     </div>
     <div class="panel">
@@ -663,6 +710,52 @@
           </div>
         {:else}
           {@render empty('No recovery attempts for this run.')}
+        {/each}
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-head">
+        <div>
+          <h2>Gates</h2>
+          <p>Durable decisions for selected run.</p>
+        </div>
+      </div>
+      <div class="tab-body attempt-list">
+        {#each detail?.gates ?? [] as gate}
+          <div class="attempt-card">
+            <span class="chip {gate.status === 'approved' ? 'completed' : gate.status === 'pending' ? 'running' : 'manual_review'}">
+              {@render statusIcon(gate.status)}
+            </span>
+            <div>
+              <strong>{gate.name}</strong>
+              <div class="meta">{gate.status}{gate.actor ? ` / ${gate.actor}` : ''}</div>
+            </div>
+          </div>
+        {:else}
+          {@render empty('No gates for this run.')}
+        {/each}
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-head">
+        <div>
+          <h2>Channel Deliveries</h2>
+          <p>Outbound notifications written by Tidebase.</p>
+        </div>
+      </div>
+      <div class="tab-body attempt-list">
+        {#each detail?.channelDeliveries ?? [] as delivery}
+          <div class="attempt-card">
+            <span class="chip {delivery.status === 'delivered' ? 'completed' : delivery.status === 'pending' ? 'running' : 'failed'}">
+              {@render statusIcon(delivery.status === 'delivered' ? 'completed' : delivery.status)}
+            </span>
+            <div>
+              <strong>{delivery.eventType}</strong>
+              <div class="meta">{delivery.status}{delivery.httpStatus ? ` / HTTP ${delivery.httpStatus}` : ''}{delivery.errorText ? ` / ${delivery.errorText}` : ''}</div>
+            </div>
+          </div>
+        {:else}
+          {@render empty('No channel deliveries for this run.')}
         {/each}
       </div>
     </div>

@@ -10,6 +10,7 @@ export type RunCreateOptions = {
   input?: unknown
   metadata?: Record<string, unknown>
   recoveryWebhook?: string
+  channels?: ChannelOptions[]
 }
 
 export type RunOptions = {
@@ -17,7 +18,23 @@ export type RunOptions = {
   input?: unknown
   metadata?: Record<string, unknown>
   recoveryWebhook?: string
+  channels?: ChannelOptions[]
 }
+
+export type ChannelOptions = {
+  type: 'webhook'
+  url: string
+  secret?: string
+  events?: string[]
+}
+
+export type CapabilityIntent = {
+  name: string
+  scopes?: string[]
+  reason?: string
+}
+
+export type CredentialIntent = CapabilityIntent
 
 export type StepOptions = {
   input?: unknown
@@ -29,6 +46,7 @@ export type StepOptions = {
   replay?: 'auto' | 'manual' | 'never'
   checkpointInvariant?: string | Record<string, unknown>
   verifiedBy?: string | Record<string, unknown>
+  credentials?: CredentialIntent[]
   /**
    * @deprecated Use sideEffects for named external operations.
    */
@@ -71,6 +89,24 @@ export type RecoveryWebhookPayload = {
   workflowName: string
   reason: string
   attempt?: number
+}
+
+export type GateOptions = {
+  prompt: string
+  data?: unknown
+  channels?: ChannelOptions[]
+  capability?: CapabilityIntent
+  timeoutMs?: number
+  pollMs?: number
+}
+
+export type GateDecision = {
+  gateId: string
+  name: string
+  status: string
+  decision: 'approved' | 'rejected' | 'canceled'
+  actor: string | null
+  payload: unknown
 }
 
 export type WebhookOptions = {
@@ -146,7 +182,8 @@ export class Tidebase {
         ? await this.runs.create(workflowName, {
             input: options.input,
             metadata: options.metadata,
-            recoveryWebhook: options.recoveryWebhook
+            recoveryWebhook: options.recoveryWebhook,
+            channels: options.channels
           })
         : await this.runs.get(options.runId).then((detail) => detail.run)
 
@@ -226,6 +263,9 @@ export class RunsClient {
       steps: unknown[]
       state: unknown
       recoveryAttempts: unknown[]
+      channels: unknown[]
+      channelDeliveries: unknown[]
+      gates: unknown[]
       events: TideEvent[]
     }>(`/runs/${runId}`)
   }
@@ -366,6 +406,56 @@ export class RunContext {
     }
     throw new Error(`Step ${name} failed`)
   }
+
+  async gate(name: string, options: GateOptions): Promise<GateDecision> {
+    const begin = await this.client.request<{
+      action: 'wait' | 'return'
+      gate: {
+        id: string
+        name: string
+        status: string
+        decision: 'approved' | 'rejected' | 'canceled' | null
+        actor: string | null
+        decisionPayload: unknown
+      }
+    }>(`/runs/${this.runId}/gates/begin`, {
+      method: 'POST',
+      body: JSON.stringify({
+        name,
+        prompt: options.prompt,
+        data: options.data ?? {},
+        channels: options.channels ?? [],
+        capability: options.capability ?? null,
+        timeoutMs: options.timeoutMs
+      })
+    })
+
+    const deadline = options.timeoutMs ? Date.now() + options.timeoutMs : null
+    let gate = begin.gate
+    while (gate.status === 'pending') {
+      if (deadline && Date.now() > deadline) {
+        throw new Error(`Gate ${name} timed out`)
+      }
+      await sleep(options.pollMs ?? 1000)
+      const response = await this.client.request<{ gate: typeof gate }>(
+        `/runs/${this.runId}/gates/${gate.id}`
+      )
+      gate = response.gate
+    }
+
+    if (gate.decision !== 'approved' && gate.decision !== 'rejected' && gate.decision !== 'canceled') {
+      throw new Error(`Gate ${name} resolved with unsupported decision ${gate.decision}`)
+    }
+
+    return {
+      gateId: gate.id,
+      name: gate.name,
+      status: gate.status,
+      decision: gate.decision,
+      actor: gate.actor,
+      payload: gate.decisionPayload
+    }
+  }
 }
 
 function classifyResumeDecision(options: StepOptions) {
@@ -435,6 +525,10 @@ async function withTimeout<T>(promiseOrValue: Promise<T> | T, timeoutMs?: number
       setTimeout(() => reject(new Error(`Timed out after ${timeoutMs}ms`)), timeoutMs)
     })
   ])
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 function serializeError(error: unknown) {

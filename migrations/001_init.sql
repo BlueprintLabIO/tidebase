@@ -67,7 +67,54 @@ create table if not exists recovery_attempts (
   completed_at timestamptz
 );
 
+create table if not exists channels (
+  id text primary key default ('chan_' || replace(gen_random_uuid()::text, '-', '')),
+  run_id text references runs(id) on delete cascade,
+  type text not null,
+  config_json jsonb not null default '{}'::jsonb,
+  events_json jsonb not null default '[]'::jsonb,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists channel_deliveries (
+  id text primary key default ('del_' || replace(gen_random_uuid()::text, '-', '')),
+  run_id text references runs(id) on delete cascade,
+  channel_id text references channels(id) on delete set null,
+  gate_id text,
+  event_type text not null,
+  payload_json jsonb not null default '{}'::jsonb,
+  status text not null default 'pending',
+  http_status integer,
+  response_body text,
+  error_text text,
+  created_at timestamptz not null default now(),
+  completed_at timestamptz
+);
+
+create table if not exists gates (
+  id text primary key default ('gate_' || replace(gen_random_uuid()::text, '-', '')),
+  run_id text not null references runs(id) on delete cascade,
+  name text not null,
+  prompt text not null,
+  data_json jsonb not null default '{}'::jsonb,
+  status text not null default 'pending',
+  decision text,
+  actor text,
+  decision_json jsonb,
+  capability_json jsonb,
+  channels_json jsonb not null default '[]'::jsonb,
+  resolve_token text not null default replace(gen_random_uuid()::text, '-', ''),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  resolved_at timestamptz,
+  unique (run_id, name)
+);
+
 create index if not exists runs_status_idx on runs(status);
 create index if not exists steps_run_id_idx on steps(run_id);
 create index if not exists events_run_id_seq_idx on events(run_id, seq);
 create index if not exists recovery_attempts_run_id_idx on recovery_attempts(run_id);
+create index if not exists channels_run_id_idx on channels(run_id);
+create index if not exists channel_deliveries_run_id_idx on channel_deliveries(run_id);
+create index if not exists gates_run_id_idx on gates(run_id);
+create index if not exists gates_status_idx on gates(status);

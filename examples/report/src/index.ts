@@ -14,7 +14,14 @@ const result = await tide.run(
     },
     metadata: {
       source: 'example-report'
-    }
+    },
+    channels: process.env.TIDEBASE_CHANNEL_WEBHOOK
+      ? [{
+          type: 'webhook',
+          url: process.env.TIDEBASE_CHANNEL_WEBHOOK,
+          events: ['run.failed', 'step.failed', 'state.updated']
+        }]
+      : []
   },
   researchReport
 )

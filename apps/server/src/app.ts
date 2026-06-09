@@ -8,13 +8,21 @@ import { appendEvent, listEvents, subscribe } from './events.js'
 
 const leaseMs = Number(process.env.TIDEBASE_LEASE_MS ?? 60_000)
 const webhookSecret = process.env.TIDEBASE_WEBHOOK_SECRET
+const publicUrl = (process.env.TIDEBASE_PUBLIC_URL ?? `http://localhost:${process.env.PORT ?? 7373}`).replace(/\/$/, '')
 
 const jsonRecord = z.record(z.string(), z.unknown())
+const channelSchema = z.object({
+  type: z.literal('webhook'),
+  url: z.string().url(),
+  secret: z.string().optional(),
+  events: z.array(z.string()).optional()
+})
 
 const createRunSchema = z.object({
   input: z.unknown().optional(),
   metadata: jsonRecord.optional(),
-  recoveryWebhook: z.string().url().optional()
+  recoveryWebhook: z.string().url().optional(),
+  channels: z.array(channelSchema).optional()
 })
 
 const beginStepSchema = z.object({
@@ -41,6 +49,22 @@ const stateSchema = z.object({
   value: z.unknown()
 })
 
+const gateBeginSchema = z.object({
+  name: z.string().min(1),
+  prompt: z.string().min(1),
+  data: z.unknown().optional(),
+  channels: z.array(channelSchema).optional(),
+  capability: z.unknown().optional(),
+  timeoutMs: z.number().int().positive().optional()
+})
+
+const gateResolveSchema = z.object({
+  token: z.string().min(1),
+  decision: z.enum(['approved', 'rejected', 'canceled']),
+  actor: z.string().optional(),
+  payload: z.unknown().optional()
+})
+
 export function createApp() {
   const app = new Hono()
   app.use('*', cors())
@@ -63,9 +87,26 @@ export function createApp() {
         ]
       )
       const run = mapRun(runResult.rows[0])
+      for (const channel of body.channels ?? []) {
+        await client.query(
+          `insert into channels (run_id, type, config_json, events_json)
+           values ($1, $2, $3, $4)`,
+          [
+            run.id,
+            channel.type,
+            json({ url: channel.url, secret: channel.secret ?? null }),
+            json(channel.events ?? [])
+          ]
+        )
+      }
       await appendEvent(client, run.id, 'run.created', {
         workflowName,
-        input: body.input ?? {}
+        input: body.input ?? {},
+        channels: body.channels?.map((channel) => ({
+          type: channel.type,
+          url: channel.url,
+          events: channel.events ?? []
+        })) ?? []
       })
       return run
     })
@@ -81,7 +122,7 @@ export function createApp() {
 
   app.get('/runs/:runId', async (c) => {
     const runId = c.req.param('runId')
-    const [runResult, stepsResult, stateResult, recoveryResult, events] = await Promise.all([
+    const [runResult, stepsResult, stateResult, recoveryResult, channelsResult, deliveriesResult, gatesResult, events] = await Promise.all([
       pool.query('select * from runs where id = $1', [runId]),
       pool.query('select * from steps where run_id = $1 order by created_at asc', [
         runId
@@ -91,6 +132,12 @@ export function createApp() {
         'select * from recovery_attempts where run_id = $1 order by created_at desc',
         [runId]
       ),
+      pool.query('select * from channels where run_id = $1 order by created_at asc', [runId]),
+      pool.query(
+        'select * from channel_deliveries where run_id = $1 order by created_at desc limit 100',
+        [runId]
+      ),
+      pool.query('select * from gates where run_id = $1 order by created_at asc', [runId]),
       listEvents(runId)
     ])
     if (!runResult.rows[0]) return c.json({ error: 'run not found' }, 404)
@@ -99,6 +146,9 @@ export function createApp() {
       steps: stepsResult.rows.map(mapStep),
       state: stateResult.rows[0] ? mapState(stateResult.rows[0]) : null,
       recoveryAttempts: recoveryResult.rows.map(mapRecoveryAttempt),
+      channels: channelsResult.rows.map(mapChannel),
+      channelDeliveries: deliveriesResult.rows.map(mapChannelDelivery),
+      gates: gatesResult.rows.map(mapGate),
       events
     })
   })
@@ -162,6 +212,7 @@ export function createApp() {
       await appendEvent(client, runId, 'run.completed', {
         result: body.result ?? null
       })
+      await deliverChannels(client, runId, 'run.completed', { run: mapRun(update.rows[0]) })
       return mapRun(update.rows[0])
     })
     if (!result) return c.json({ error: 'run not found' }, 404)
@@ -185,11 +236,95 @@ export function createApp() {
       )
       if (!update.rows[0]) return null
       await appendEvent(client, runId, 'run.failed', { error: body.error ?? {} })
+      await deliverChannels(client, runId, 'run.failed', {
+        run: mapRun(update.rows[0]),
+        error: body.error ?? {}
+      })
       return mapRun(update.rows[0])
     })
     if (!run) return c.json({ error: 'run not found' }, 404)
     await dispatchRecovery(run, 'run_failed')
     return c.json({ run })
+  })
+
+  app.post('/runs/:runId/gates/begin', async (c) => {
+    const runId = c.req.param('runId')
+    const body = gateBeginSchema.parse(await c.req.json())
+    const result = await tx(async (client) => {
+      const existing = await client.query(
+        `select * from gates where run_id = $1 and name = $2 for update`,
+        [runId, body.name]
+      )
+      if (existing.rows[0]) {
+        return mapGate(existing.rows[0])
+      }
+
+      const inserted = await client.query(
+        `insert into gates (run_id, name, prompt, data_json, capability_json, channels_json)
+         values ($1, $2, $3, $4, $5, $6)
+         returning *`,
+        [
+          runId,
+          body.name,
+          body.prompt,
+          json(body.data ?? {}),
+          json(body.capability ?? null),
+          json(body.channels ?? [])
+        ]
+      )
+      const gate = mapGate(inserted.rows[0])
+      await appendEvent(client, runId, 'gate.created', {
+        gate: publicGate(gate)
+      })
+      await deliverChannels(client, runId, 'gate.created', { gate: publicGate(gate) }, body.channels ?? [], gate.id)
+      return gate
+    })
+    return c.json({ action: result.status === 'pending' ? 'wait' : 'return', gate: result })
+  })
+
+  app.get('/runs/:runId/gates/:gateId', async (c) => {
+    const result = await pool.query(
+      'select * from gates where run_id = $1 and id = $2',
+      [c.req.param('runId'), c.req.param('gateId')]
+    )
+    if (!result.rows[0]) return c.json({ error: 'gate not found' }, 404)
+    return c.json({ gate: mapGate(result.rows[0]) })
+  })
+
+  app.post('/runs/:runId/gates/:gateId/resolve', async (c) => {
+    const runId = c.req.param('runId')
+    const gateId = c.req.param('gateId')
+    const body = gateResolveSchema.parse(await c.req.json())
+    const gate = await tx(async (client) => {
+      const update = await client.query(
+        `update gates
+         set status = $4,
+             decision = $4,
+             actor = $5,
+             decision_json = $6,
+             resolved_at = now(),
+             updated_at = now()
+         where run_id = $1 and id = $2 and resolve_token = $3 and status = 'pending'
+         returning *`,
+        [
+          runId,
+          gateId,
+          body.token,
+          body.decision,
+          body.actor ?? null,
+          json(body.payload ?? {})
+        ]
+      )
+      if (!update.rows[0]) return null
+      const resolved = mapGate(update.rows[0])
+      await appendEvent(client, runId, 'gate.resolved', {
+        gate: publicGate(resolved)
+      })
+      await deliverChannels(client, runId, 'gate.resolved', { gate: publicGate(resolved) }, resolved.channels, gateId)
+      return resolved
+    })
+    if (!gate) return c.json({ error: 'gate not found, already resolved, or invalid token' }, 409)
+    return c.json({ gate })
   })
 
   app.post('/runs/:runId/recover', async (c) => {
@@ -344,6 +479,12 @@ export function createApp() {
         resumeContract: normalizeResumeContract(update.rows[0].options_json),
         error: body.error
       })
+      await deliverChannels(client, runId, 'step.failed', {
+        step: mapStep(update.rows[0]),
+        retryable: body.retryable ?? false,
+        resumeDecision,
+        error: body.error
+      })
       return mapStep(update.rows[0])
     })
     if (!result) return c.json({ error: 'step not found or lease lost' }, 409)
@@ -365,6 +506,9 @@ export function createApp() {
         [runId, json(body.value ?? {})]
       )
       await appendEvent(client, runId, 'state.updated', { value: body.value })
+      await deliverChannels(client, runId, 'state.updated', {
+        state: mapState(result.rows[0])
+      })
       return mapState(result.rows[0])
     })
     return c.json({ state })
@@ -385,6 +529,9 @@ export function createApp() {
         [runId, json(body.value ?? {})]
       )
       await appendEvent(client, runId, 'state.updated', { value: result.rows[0].value_json })
+      await deliverChannels(client, runId, 'state.updated', {
+        state: mapState(result.rows[0])
+      })
       return mapState(result.rows[0])
     })
     return c.json({ state })
@@ -522,6 +669,108 @@ function json(value: unknown) {
   return JSON.stringify(value)
 }
 
+async function deliverChannels(
+  client: { query: (text: string, values?: unknown[]) => Promise<{ rows: Record<string, any>[] }> },
+  runId: string,
+  eventType: string,
+  payload: unknown,
+  inlineChannels: unknown[] = [],
+  gateId: string | null = null
+) {
+  const stored = await client.query('select * from channels where run_id = $1', [runId])
+  const channels = [
+    ...stored.rows.map(mapChannel),
+    ...inlineChannels.map((channel) => normalizeInlineChannel(channel)).filter((channel): channel is ReturnType<typeof normalizeInlineChannel> & {} => Boolean(channel))
+  ].filter((channel) => channelMatchesEvent(channel, eventType))
+
+  for (const channel of channels) {
+    if (channel.type !== 'webhook') continue
+    const delivery = await client.query(
+      `insert into channel_deliveries (run_id, channel_id, gate_id, event_type, payload_json, status)
+       values ($1, $2, $3, $4, $5, 'pending')
+       returning *`,
+      [runId, 'id' in channel ? channel.id : null, gateId, eventType, json(payload ?? {})]
+    )
+    const deliveryId = delivery.rows[0].id as string
+    try {
+      const body = JSON.stringify({
+        type: eventType,
+        runId,
+        gateId,
+        deliveryId,
+        payload
+      })
+      const secret = channel.config.secret
+      const response = await fetch(channel.config.url, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'user-agent': 'tidebase-channel/0.0.0',
+          ...(secret
+            ? { 'x-tidebase-signature': `sha256=${createHmac('sha256', secret).update(body).digest('hex')}` }
+            : {})
+        },
+        body
+      })
+      const responseBody = await response.text()
+      await client.query(
+        `update channel_deliveries
+         set status = $2,
+             http_status = $3,
+             response_body = $4,
+             completed_at = now()
+         where id = $1`,
+        [deliveryId, response.ok ? 'delivered' : 'failed', response.status, responseBody.slice(0, 8000)]
+      )
+    } catch (error) {
+      await client.query(
+        `update channel_deliveries
+         set status = 'failed',
+             error_text = $2,
+             completed_at = now()
+         where id = $1`,
+        [deliveryId, error instanceof Error ? error.message : String(error)]
+      )
+    }
+  }
+}
+
+function normalizeInlineChannel(value: unknown) {
+  const parsed = channelSchema.safeParse(value)
+  if (!parsed.success) return null
+  return {
+    type: parsed.data.type,
+    config: {
+      url: parsed.data.url,
+      secret: parsed.data.secret ?? null
+    },
+    events: parsed.data.events ?? []
+  }
+}
+
+function channelMatchesEvent(
+  channel: { events: string[] },
+  eventType: string
+) {
+  return channel.events.length === 0 || channel.events.includes(eventType)
+}
+
+function publicGate(gate: ReturnType<typeof mapGate>) {
+  return {
+    id: gate.id,
+    runId: gate.runId,
+    name: gate.name,
+    prompt: gate.prompt,
+    data: gate.data,
+    status: gate.status,
+    decision: gate.decision,
+    actor: gate.actor,
+    capability: gate.capability,
+    resolveUrl: `${publicUrl}/runs/${gate.runId}/gates/${gate.id}/resolve`,
+    resolveToken: gate.resolveToken
+  }
+}
+
 function normalizeResumeContract(optionsJson: unknown) {
   const options = isRecord(optionsJson) ? optionsJson : {}
   const legacySideEffect = typeof options.sideEffect === 'string' ? options.sideEffect : 'none'
@@ -546,7 +795,8 @@ function normalizeResumeContract(optionsJson: unknown) {
     idempotencyKey: typeof options.idempotencyKey === 'string' ? options.idempotencyKey : null,
     replay,
     checkpointInvariant: options.checkpointInvariant ?? null,
-    verifiedBy: options.verifiedBy ?? null
+    verifiedBy: options.verifiedBy ?? null,
+    credentials: Array.isArray(options.credentials) ? options.credentials : []
   }
 }
 
@@ -592,6 +842,60 @@ function mapStep(row: Record<string, any>) {
     completedAt: row.completed_at?.toISOString?.() ?? null,
     createdAt: row.created_at.toISOString(),
     updatedAt: row.updated_at.toISOString()
+  }
+}
+
+function mapChannel(row: Record<string, any>) {
+  const config = isRecord(row.config_json) ? row.config_json : {}
+  return {
+    id: row.id as string,
+    runId: row.run_id as string | null,
+    type: row.type as string,
+    config: {
+      url: typeof config.url === 'string' ? config.url : '',
+      secret: typeof config.secret === 'string' ? config.secret : null
+    },
+    events: Array.isArray(row.events_json)
+      ? row.events_json.filter((event): event is string => typeof event === 'string')
+      : [],
+    createdAt: row.created_at.toISOString()
+  }
+}
+
+function mapChannelDelivery(row: Record<string, any>) {
+  return {
+    id: row.id as string,
+    runId: row.run_id as string | null,
+    channelId: row.channel_id as string | null,
+    gateId: row.gate_id as string | null,
+    eventType: row.event_type as string,
+    payload: row.payload_json,
+    status: row.status as string,
+    httpStatus: row.http_status as number | null,
+    responseBody: row.response_body as string | null,
+    errorText: row.error_text as string | null,
+    createdAt: row.created_at.toISOString(),
+    completedAt: row.completed_at?.toISOString?.() ?? null
+  }
+}
+
+function mapGate(row: Record<string, any>) {
+  return {
+    id: row.id as string,
+    runId: row.run_id as string,
+    name: row.name as string,
+    prompt: row.prompt as string,
+    data: row.data_json,
+    status: row.status as string,
+    decision: row.decision as string | null,
+    actor: row.actor as string | null,
+    decisionPayload: row.decision_json,
+    capability: row.capability_json,
+    channels: Array.isArray(row.channels_json) ? row.channels_json : [],
+    resolveToken: row.resolve_token as string,
+    createdAt: row.created_at.toISOString(),
+    updatedAt: row.updated_at.toISOString(),
+    resolvedAt: row.resolved_at?.toISOString?.() ?? null
   }
 }
 

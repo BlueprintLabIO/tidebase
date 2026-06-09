@@ -42,7 +42,12 @@ export const researchReport: TideWorkflow<{ topic: string }, { report: string }>
       sideEffects: ['report.write'],
       replay: 'manual',
       checkpointInvariant: 'report text was generated and returned by the step',
-      verifiedBy: 'example workflow result'
+      verifiedBy: 'example workflow result',
+      credentials: [{
+        name: 'report-store',
+        scopes: ['report:write'],
+        reason: 'persist generated report after replay-safe inputs exist'
+      }]
     },
     async () => {
       await delay(250)

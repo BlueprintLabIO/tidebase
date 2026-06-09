@@ -129,6 +129,58 @@ The alpha stores this contract with the step, shows it in Studio, and records it
 
 This does not make external systems exactly-once. It makes the resume decision explicit instead of hiding it in logs and custom retry flags.
 
+## Channels And Gates
+
+Channels deliver Tidebase events to external surfaces. The alpha supports webhook channels:
+
+```typescript
+await tide.run(
+  'generate-report',
+  {
+    input: { topic: 'channels' },
+    channels: [{
+      type: 'webhook',
+      url: 'https://your-app.example.com/api/tidebase-events',
+      events: ['run.failed', 'step.failed', 'gate.created']
+    }]
+  },
+  workflow
+)
+```
+
+Gates create durable decisions that can be resolved by a product UI, Slack/Teams adapter, internal tool, or Studio fallback:
+
+```typescript
+const decision = await run.gate('approve-send', {
+  prompt: 'Send this report to the customer?',
+  data: { reportId },
+  channels: [{ type: 'webhook', url: process.env.REVIEW_WEBHOOK_URL! }],
+  capability: {
+    name: 'report.send',
+    scopes: ['report:send'],
+    reason: 'agent wants to send an external report'
+  }
+})
+
+if (decision.decision !== 'approved') {
+  throw new Error('Report was not approved')
+}
+```
+
+Webhook gate payloads include `resolveUrl` and `resolveToken`. An adapter resolves the gate by posting:
+
+```http
+POST /runs/:runId/gates/:gateId/resolve
+{
+  "token": "resolve_token",
+  "decision": "approved",
+  "actor": "slack:U123",
+  "payload": { "comment": "looks good" }
+}
+```
+
+Credential and capability fields are audit metadata only. Tidebase does not store or broker API keys in this alpha.
+
 ## Current Scope
 
 - Postgres-backed run store
@@ -136,6 +188,9 @@ This does not make external systems exactly-once. It makes the resume decision e
 - run and step leases
 - input-hash checks to prevent stale checkpoint reuse
 - step resume contracts for side effects, idempotency keys, replay policy, and checkpoint invariants
+- webhook channels
+- durable gates
+- credential/capability audit metadata
 - live state set/patch
 - append-only run events
 - SSE event stream
@@ -148,9 +203,9 @@ This does not make external systems exactly-once. It makes the resume decision e
 
 - Tidebase-hosted code execution
 - queues or worker deployment
-- approval gates
 - LLM gateway/proxying
-- channels
+- hosted channel adapters
+- secret custody / credential brokering
 - memory
 - auth
 - hosted cloud
