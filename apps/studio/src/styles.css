@@ -41,7 +41,7 @@ p {
 }
 
 .studio.sidebar-collapsed {
-  grid-template-columns: 72px minmax(0, 1fr);
+  grid-template-columns: 56px minmax(0, 1fr);
 }
 
 .sidebar {
@@ -200,12 +200,18 @@ p {
 
 .sidebar-collapsed .sidebar {
   align-items: center;
-  padding-inline: 12px;
+  padding-inline: 8px;
 }
 
 .sidebar-collapsed .brand {
   justify-content: center;
   padding-inline: 0;
+  width: 32px;
+}
+
+.sidebar-collapsed .brand-mark {
+  height: 32px;
+  width: 32px;
 }
 
 .sidebar-collapsed .brand strong,
@@ -216,10 +222,16 @@ p {
 }
 
 .sidebar-collapsed .server-status {
-  height: 38px;
+  border-radius: var(--radius-md);
+  height: 32px;
   justify-content: center;
   padding: 0;
-  width: 38px;
+  width: 32px;
+}
+
+.sidebar-collapsed .project-dot {
+  height: 8px;
+  width: 8px;
 }
 
 .sidebar-collapsed .nav {
@@ -227,8 +239,16 @@ p {
 }
 
 .sidebar-collapsed .nav-button {
+  border-radius: var(--radius-md);
+  height: 32px;
   justify-content: center;
   padding: 0;
+  width: 32px;
+}
+
+.sidebar-collapsed .nav-button svg {
+  height: 17px;
+  width: 17px;
 }
 
 .topbar {
