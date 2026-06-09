@@ -37,6 +37,11 @@ p {
   display: grid;
   grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
   min-height: 100vh;
+  transition: grid-template-columns var(--dur-normal) var(--ease-out);
+}
+
+.studio.sidebar-collapsed {
+  grid-template-columns: 72px minmax(0, 1fr);
 }
 
 .sidebar {
@@ -47,6 +52,7 @@ p {
   flex-direction: column;
   gap: var(--space-4);
   min-height: 100vh;
+  overflow: hidden;
   padding: var(--space-4) var(--space-3);
   position: sticky;
   top: 0;
@@ -57,6 +63,7 @@ p {
   display: flex;
   gap: 9px;
   padding: 6px 8px 0;
+  white-space: nowrap;
 }
 
 .brand-mark,
@@ -128,6 +135,10 @@ p {
   width: 100%;
 }
 
+.nav-button svg {
+  flex: none;
+}
+
 .nav-button:hover {
   background: var(--surface-hover);
   color: var(--text-strong);
@@ -153,6 +164,7 @@ p {
   gap: 10px;
   padding: 9px 11px;
   text-align: left;
+  white-space: nowrap;
 }
 
 .project-dot {
@@ -186,6 +198,39 @@ p {
   min-width: 0;
 }
 
+.sidebar-collapsed .sidebar {
+  align-items: center;
+  padding-inline: 12px;
+}
+
+.sidebar-collapsed .brand {
+  justify-content: center;
+  padding-inline: 0;
+}
+
+.sidebar-collapsed .brand strong,
+.sidebar-collapsed .server-status div,
+.sidebar-collapsed .nav-label,
+.sidebar-collapsed .nav-button span {
+  display: none;
+}
+
+.sidebar-collapsed .server-status {
+  height: 38px;
+  justify-content: center;
+  padding: 0;
+  width: 38px;
+}
+
+.sidebar-collapsed .nav {
+  width: 100%;
+}
+
+.sidebar-collapsed .nav-button {
+  justify-content: center;
+  padding: 0;
+}
+
 .topbar {
   align-items: center;
   background: rgba(255, 255, 255, 0.72);
@@ -200,6 +245,10 @@ p {
   z-index: 5;
   -webkit-backdrop-filter: blur(20px) saturate(150%);
   backdrop-filter: blur(20px) saturate(150%);
+}
+
+.topbar-heading {
+  min-width: 0;
 }
 
 .topbar h1 {
@@ -220,6 +269,27 @@ p {
   align-items: center;
   display: flex;
   gap: var(--space-2);
+}
+
+.icon-button {
+  align-items: center;
+  background: var(--surface-card);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-input);
+  color: var(--text-muted);
+  display: inline-flex;
+  flex: none;
+  height: 38px;
+  justify-content: center;
+  padding: 0;
+  transition: var(--transition-colors), box-shadow var(--dur-fast) var(--ease-out);
+  width: 38px;
+}
+
+.icon-button:hover {
+  background: var(--surface-hover);
+  border-color: var(--border-strong);
+  color: var(--text-strong);
 }
 
 .endpoint,

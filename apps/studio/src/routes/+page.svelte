@@ -8,6 +8,8 @@
     Copy,
     Database,
     GitBranch,
+    PanelLeftClose,
+    PanelLeftOpen,
     RefreshCw,
     RotateCcw,
     Search,
@@ -146,6 +148,7 @@
   let selectedTab = $state<RunTab>('steps')
   let selectedRunId = $state<string | null>(null)
   let query = $state('')
+  let sidebarCollapsed = $state(false)
   let streamState = $state<'idle' | 'connected' | 'disconnected'>('idle')
   let source: EventSource | null = null
   const queryClient = useQueryClient()
@@ -349,7 +352,7 @@
   <title>Tidebase Studio</title>
 </svelte:head>
 
-<div class="studio">
+<div class="studio" class:sidebar-collapsed={sidebarCollapsed}>
   <aside class="sidebar">
     <div class="brand">
       <span class="brand-mark"><img src="/tidebase-mark.svg" alt="" /></span>
@@ -369,23 +372,35 @@
     <div class="nav-label">Workspace</div>
     <nav class="nav" aria-label="Studio views">
       <button class:active={activeView === 'runs'} class="nav-button" onclick={() => (activeView = 'runs')}>
-        <Activity size={17} /> Runs
+        <Activity size={17} /> <span>Runs</span>
       </button>
       <button class:active={activeView === 'checkpoints'} class="nav-button" onclick={() => (activeView = 'checkpoints')}>
-        <GitBranch size={17} /> Checkpoints
+        <GitBranch size={17} /> <span>Checkpoints</span>
       </button>
       <button class:active={activeView === 'recovery'} class="nav-button" onclick={() => (activeView = 'recovery')}>
-        <RotateCcw size={17} /> Control
+        <RotateCcw size={17} /> <span>Control</span>
       </button>
       <button class:active={activeView === 'postgres'} class="nav-button" onclick={() => (activeView = 'postgres')}>
-        <Database size={17} /> Postgres
+        <Database size={17} /> <span>Postgres</span>
       </button>
     </nav>
   </aside>
 
   <section class="main">
     <header class="topbar">
-      <div>
+      <button
+        aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+        class="icon-button"
+        title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+        onclick={() => (sidebarCollapsed = !sidebarCollapsed)}
+      >
+        {#if sidebarCollapsed}
+          <PanelLeftOpen size={17} />
+        {:else}
+          <PanelLeftClose size={17} />
+        {/if}
+      </button>
+      <div class="topbar-heading">
         <h1>{viewMeta[activeView].title}</h1>
         <p>{viewMeta[activeView].subtitle}</p>
       </div>
