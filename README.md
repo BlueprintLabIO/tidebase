@@ -9,6 +9,13 @@
 </p>
 
 <p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-0aabc0.svg" alt="License: Apache-2.0"></a>
+  <a href="https://github.com/BlueprintLabIO/tidebase/releases"><img src="https://img.shields.io/github/v/release/BlueprintLabIO/tidebase?color=0aabc0" alt="Latest release"></a>
+  <img src="https://img.shields.io/badge/SDK-TypeScript-0e6f80.svg" alt="TypeScript SDK">
+  <img src="https://img.shields.io/badge/storage-Postgres-0e6f80.svg" alt="Postgres storage">
+</p>
+
+<p align="center">
   <a href="#quick-start">Quick start</a>
   ·
   <a href="#api-shape">API</a>
@@ -19,16 +26,6 @@
 </p>
 
 ![Tidebase Studio](docs/assets/dashboard-shot.png)
-
-<!--
-Demo video:
-Export the product film from the design-system video composition, upload the mp4/webm
-to a GitHub issue, release, or README edit, then paste the generated URL here.
-GitHub renders user-attachments video URLs as an embedded player.
-
-Example:
-https://github.com/user-attachments/assets/...
--->
 
 Tidebase is a self-hosted run backend for long-running agent workflows.
 
@@ -90,6 +87,10 @@ TIDEBASE_RUN_ID=run_xxx pnpm example
 ```
 
 The `plan` and `fetch-sources` steps are returned from checkpoints. Only `write-report` executes again.
+
+<p align="center">
+  <img src="docs/assets/crash-resume.gif" width="820" alt="Kill the process mid-run, re-invoke with the same run id, and the workflow resumes from the last checkpoint">
+</p>
 
 ## API Shape
 
@@ -178,6 +179,10 @@ restore = append a new version based on an older version
 
 Tidebase stores and exposes the versions. Your app decides what restore or fork means for its own state targets.
 
+<p align="center">
+  <img src="docs/assets/time-travel.gif" width="820" alt="Rewind a run to an earlier step, swap the model, and fork a new branch — completed steps replay from checkpoints">
+</p>
+
 ## Child Runs And Fanout
 
 Longer agent workflows often fan out to subagents and rejoin their results. Tidebase v0.2 models that as parent/child run edges plus a checkpointed join step.
@@ -203,6 +208,10 @@ const results = await run.fanout('research-options', [
 ```
 
 Child run creation is idempotent by parent run and edge name. If the parent resumes, Tidebase returns the existing child runs instead of creating duplicates. The joined result is stored in a normal checkpointed step named `join:<fanout-name>`.
+
+<p align="center">
+  <img src="docs/assets/fanout.gif" width="820" alt="Parallel sub-agents run as child runs, each checkpointed independently, and join on completion">
+</p>
 
 ## Gates And Channels
 
@@ -243,6 +252,10 @@ if (decision.decision !== 'approved') {
 ```
 
 Webhook gate payloads include a `resolveUrl` and `resolveToken`. Credential and capability fields are audit metadata only; Tidebase does not store or broker API keys in this alpha.
+
+<p align="center">
+  <img src="docs/assets/gates.gif" width="820" alt="A run pauses at a durable gate, a human approves the capability, and the workflow continues — fully audited">
+</p>
 
 Run a local approval channel:
 
