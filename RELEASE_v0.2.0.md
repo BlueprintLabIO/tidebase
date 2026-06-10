@@ -71,4 +71,4 @@ The existing `run_state` table remains as the latest-state cache for backwards c
 
 Existing `run.state.set()` and `run.state.patch()` calls continue to work. They now also append state versions automatically.
 
-The snapshot APIs are convenience APIs over labeled state versions. Tidebase does not own app-specific restore behavior; consumers such as Aura decide what restore or fork means for their own state targets.
+The snapshot APIs are convenience APIs over labeled state versions. Tidebase does not own app-specific restore behavior; your app decides what restore or fork means for its own state targets.
