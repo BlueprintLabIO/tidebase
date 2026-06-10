@@ -1,7 +1,7 @@
 {
   "name": "tidebase",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.3.0",
   "license": "Apache-2.0",
   "type": "module",
   "scripts": {
@@ -16,7 +16,8 @@
     "example:review": "pnpm --filter @tidebase/example-report review",
     "build": "pnpm -r build",
     "check": "pnpm --filter @tidebase/sdk build && pnpm -r check",
-    "verify": "pnpm check && pnpm build"
+    "test": "pnpm --filter @tidebase/sdk build && pnpm -r test",
+    "verify": "pnpm check && pnpm build && pnpm test"
   },
   "devDependencies": {
     "@types/node": "^22.10.7",
