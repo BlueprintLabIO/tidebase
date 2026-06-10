@@ -78,6 +78,67 @@ export type TideEvent = {
   createdAt: string
 }
 
+export type StateVersionImportance = 'transient' | 'normal' | 'checkpoint' | 'milestone'
+
+export type StateWriteOptions = {
+  stream?: string
+  label?: string
+  reason?: string
+  importance?: StateVersionImportance
+  metadata?: Record<string, unknown>
+  createdBy?: string
+}
+
+export type StateSaveOptions = Omit<StateWriteOptions, 'label'>
+
+export type StateVersion = {
+  id: string
+  streamId: string
+  runId: string | null
+  stepId: string | null
+  version: number
+  value: unknown
+  patch: unknown
+  label: string | null
+  reason: string | null
+  importance: string
+  metadata: Record<string, unknown>
+  createdBy: string | null
+  createdAt: string
+}
+
+export type SnapshotCreateOptions = {
+  target?: {
+    type: string
+    id: string
+  }
+  state: unknown
+  reason?: string
+  metadata?: Record<string, unknown>
+  createdBy?: string
+}
+
+export type ChildRunOptions = RunCreateOptions & {
+  name?: string
+  edgeType?: string
+  edgeMetadata?: Record<string, unknown>
+}
+
+export type FanoutChild<TInput = unknown, TResult = unknown> = {
+  name: string
+  workflowName?: string
+  input?: TInput
+  metadata?: Record<string, unknown>
+  recoveryWebhook?: string
+  channels?: ChannelOptions[]
+  workflow: TideWorkflow<TInput, TResult>
+}
+
+export type FanoutOptions = {
+  checkpoint?: string
+  join?: 'all'
+}
+
 export type TideWorkflow<TInput = unknown, TResult = unknown> = (
   run: RunContext,
   input: TInput
@@ -277,6 +338,10 @@ export class RunsClient {
       run: TideRun
       steps: unknown[]
       state: unknown
+      stateStreams: unknown[]
+      stateVersions: StateVersion[]
+      runEdges: unknown[]
+      childRuns: TideRun[]
       recoveryAttempts: unknown[]
       channels: unknown[]
       channelDeliveries: unknown[]
@@ -332,6 +397,7 @@ export class RunsClient {
 export class RunContext {
   readonly state: RunState
   readonly usage: RunUsage
+  readonly snapshots: RunSnapshots
 
   constructor(
     private readonly client: Tidebase,
@@ -340,6 +406,7 @@ export class RunContext {
   ) {
     this.state = new RunState(client, runId)
     this.usage = new RunUsage(client, runId)
+    this.snapshots = new RunSnapshots(client, runId)
   }
 
   async step<TResult>(
@@ -473,6 +540,71 @@ export class RunContext {
       payload: gate.decisionPayload
     }
   }
+
+  async child<TInput = unknown, TResult = unknown>(
+    workflowName: string,
+    options: ChildRunOptions,
+    workflow: TideWorkflow<TInput, TResult>
+  ): Promise<TResult> {
+    const edgeName = options.name ?? workflowName
+    const response = await this.client.request<{
+      run: TideRun
+      edge: unknown
+      created: boolean
+    }>(`/runs/${this.runId}/children`, {
+      method: 'POST',
+      body: JSON.stringify({
+        name: edgeName,
+        workflowName,
+        input: options.input,
+        metadata: options.metadata,
+        recoveryWebhook: options.recoveryWebhook,
+        channels: options.channels,
+        edgeType: options.edgeType ?? 'child',
+        edgeMetadata: options.edgeMetadata
+      })
+    })
+
+    return this.client.run(workflowName, { runId: response.run.id }, workflow)
+  }
+
+  async fanout<TResult = unknown>(
+    name: string,
+    children: FanoutChild[],
+    options: FanoutOptions = {}
+  ): Promise<TResult[]> {
+    const results = await Promise.all(
+      children.map((child) =>
+        this.child(
+          child.workflowName ?? child.name,
+          {
+            name: child.name,
+            input: child.input,
+            metadata: child.metadata,
+            recoveryWebhook: child.recoveryWebhook,
+            channels: child.channels,
+            edgeType: 'fanout',
+            edgeMetadata: { fanout: name }
+          },
+          child.workflow
+        )
+      )
+    )
+
+    return this.step(
+      `join:${options.checkpoint ?? name}`,
+      {
+        input: {
+          fanout: name,
+          join: options.join ?? 'all',
+          children: children.map((child) => child.name)
+        },
+        replay: 'auto',
+        checkpointInvariant: 'all child run results were collected'
+      },
+      () => results as TResult[]
+    )
+  }
 }
 
 function classifyResumeDecision(options: StepOptions) {
@@ -515,18 +647,61 @@ export class RunState {
     private readonly runId: string
   ) {}
 
-  async set(value: unknown) {
+  async set(value: unknown, options: StateWriteOptions = {}) {
     return this.client.request(`/runs/${this.runId}/state`, {
       method: 'PUT',
-      body: JSON.stringify({ value })
+      body: JSON.stringify({ value, ...options })
     })
   }
 
-  async patch(value: Record<string, unknown>) {
+  async patch(value: Record<string, unknown>, options: StateWriteOptions = {}) {
     return this.client.request(`/runs/${this.runId}/state`, {
       method: 'PATCH',
-      body: JSON.stringify({ value })
+      body: JSON.stringify({ value, ...options })
     })
+  }
+
+  async save(label: string, options: StateSaveOptions = {}) {
+    return this.client.request<{ stateVersion: StateVersion }>(
+      `/runs/${this.runId}/state/save`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ label, ...options })
+      }
+    )
+  }
+
+  async versions(options: { stream?: string; labeled?: boolean } = {}) {
+    const params = new URLSearchParams()
+    if (options.stream) params.set('stream', options.stream)
+    if (options.labeled != null) params.set('labeled', String(options.labeled))
+    const suffix = params.size > 0 ? `?${params}` : ''
+    return this.client.request<{ stateVersions: StateVersion[] }>(
+      `/runs/${this.runId}/state/versions${suffix}`
+    )
+  }
+}
+
+export class RunSnapshots {
+  constructor(
+    private readonly client: Tidebase,
+    private readonly runId: string
+  ) {}
+
+  async create(label: string, options: SnapshotCreateOptions) {
+    return this.client.request<{ snapshot: StateVersion }>(
+      `/runs/${this.runId}/snapshots`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ label, ...options })
+      }
+    )
+  }
+
+  async list() {
+    return this.client.request<{ snapshots: StateVersion[] }>(
+      `/runs/${this.runId}/snapshots`
+    )
   }
 }
 

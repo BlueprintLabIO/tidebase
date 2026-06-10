@@ -46,7 +46,45 @@ const failStepSchema = z.object({
 })
 
 const stateSchema = z.object({
-  value: z.unknown()
+  value: z.unknown(),
+  stream: z.string().min(1).optional(),
+  label: z.string().min(1).optional(),
+  reason: z.string().optional(),
+  importance: z.enum(['transient', 'normal', 'checkpoint', 'milestone']).optional(),
+  metadata: jsonRecord.optional(),
+  createdBy: z.string().optional()
+})
+
+const stateSaveSchema = z.object({
+  stream: z.string().min(1).optional(),
+  label: z.string().min(1),
+  reason: z.string().optional(),
+  importance: z.enum(['transient', 'normal', 'checkpoint', 'milestone']).optional(),
+  metadata: jsonRecord.optional(),
+  createdBy: z.string().optional()
+})
+
+const snapshotSchema = z.object({
+  label: z.string().min(1),
+  target: z.object({
+    type: z.string().min(1),
+    id: z.string().min(1)
+  }).optional(),
+  state: z.unknown(),
+  reason: z.string().optional(),
+  metadata: jsonRecord.optional(),
+  createdBy: z.string().optional()
+})
+
+const createChildRunSchema = z.object({
+  name: z.string().min(1),
+  workflowName: z.string().min(1),
+  input: z.unknown().optional(),
+  metadata: jsonRecord.optional(),
+  recoveryWebhook: z.string().url().optional(),
+  channels: z.array(channelSchema).optional(),
+  edgeType: z.string().min(1).optional(),
+  edgeMetadata: jsonRecord.optional()
 })
 
 const usageSchema = z.object({
@@ -137,12 +175,30 @@ export function createApp() {
 
   app.get('/runs/:runId', async (c) => {
     const runId = c.req.param('runId')
-    const [runResult, stepsResult, stateResult, recoveryResult, channelsResult, deliveriesResult, gatesResult, usageResult, events] = await Promise.all([
+    const [runResult, stepsResult, stateResult, streamsResult, versionsResult, edgeResult, childRunsResult, recoveryResult, channelsResult, deliveriesResult, gatesResult, usageResult, events] = await Promise.all([
       pool.query('select * from runs where id = $1', [runId]),
       pool.query('select * from steps where run_id = $1 order by created_at asc', [
         runId
       ]),
       pool.query('select * from run_state where run_id = $1', [runId]),
+      pool.query('select * from state_streams where run_id = $1 order by created_at asc', [runId]),
+      pool.query(
+        `select v.*
+         from state_versions v
+         join state_streams s on s.id = v.stream_id
+         where s.run_id = $1
+         order by s.name asc, v.version asc`,
+        [runId]
+      ),
+      pool.query('select * from run_edges where parent_run_id = $1 order by created_at asc', [runId]),
+      pool.query(
+        `select r.*
+         from runs r
+         join run_edges e on e.child_run_id = r.id
+         where e.parent_run_id = $1
+         order by e.created_at asc`,
+        [runId]
+      ),
       pool.query(
         'select * from recovery_attempts where run_id = $1 order by created_at desc',
         [runId]
@@ -161,6 +217,10 @@ export function createApp() {
       run: mapRun(runResult.rows[0]),
       steps: stepsResult.rows.map(mapStep),
       state: stateResult.rows[0] ? mapState(stateResult.rows[0]) : null,
+      stateStreams: streamsResult.rows.map(mapStateStream),
+      stateVersions: versionsResult.rows.map(mapStateVersion),
+      runEdges: edgeResult.rows.map(mapRunEdge),
+      childRuns: childRunsResult.rows.map(mapRun),
       recoveryAttempts: recoveryResult.rows.map(mapRecoveryAttempt),
       channels: channelsResult.rows.map(mapChannel),
       channelDeliveries: deliveriesResult.rows.map(mapChannelDelivery),
@@ -168,6 +228,98 @@ export function createApp() {
       usage: usageResult.rows.map(mapUsageRecord),
       events
     })
+  })
+
+  app.post('/runs/:runId/children', async (c) => {
+    const parentRunId = c.req.param('runId')
+    const body = createChildRunSchema.parse(await c.req.json())
+    const result = await tx(async (client) => {
+      const parent = await client.query('select * from runs where id = $1 for update', [parentRunId])
+      if (!parent.rows[0]) return null
+
+      const existing = await client.query(
+        `select
+           r.*,
+           e.id as edge_id,
+           e.parent_run_id as edge_parent_run_id,
+           e.child_run_id as edge_child_run_id,
+           e.name as edge_name,
+           e.edge_type as edge_edge_type,
+           e.metadata_json as edge_metadata_json,
+           e.created_at as edge_created_at
+         from run_edges e
+         join runs r on r.id = e.child_run_id
+         where e.parent_run_id = $1 and e.name = $2`,
+        [parentRunId, body.name]
+      )
+      if (existing.rows[0]) {
+        return {
+          run: mapRun(existing.rows[0]),
+          edge: mapRunEdge(existing.rows[0]),
+          created: false
+        }
+      }
+
+      const runResult = await client.query(
+        `insert into runs (workflow_name, input_json, metadata_json, recovery_webhook)
+         values ($1, $2, $3, $4)
+         returning *`,
+        [
+          body.workflowName,
+          json(body.input ?? {}),
+          json({
+            ...(body.metadata ?? {}),
+            parentRunId,
+            parentEdgeName: body.name
+          }),
+          body.recoveryWebhook ?? null
+        ]
+      )
+      const childRun = mapRun(runResult.rows[0])
+      for (const channel of body.channels ?? []) {
+        await client.query(
+          `insert into channels (run_id, type, config_json, events_json)
+           values ($1, $2, $3, $4)`,
+          [
+            childRun.id,
+            channel.type,
+            json({ url: channel.url, secret: channel.secret ?? null }),
+            json(channel.events ?? [])
+          ]
+        )
+      }
+      const edgeResult = await client.query(
+        `insert into run_edges (parent_run_id, child_run_id, name, edge_type, metadata_json)
+         values ($1, $2, $3, $4, $5)
+         returning *`,
+        [
+          parentRunId,
+          childRun.id,
+          body.name,
+          body.edgeType ?? 'child',
+          json(body.edgeMetadata ?? {})
+        ]
+      )
+      const edge = mapRunEdge(edgeResult.rows[0])
+      await appendEvent(client, childRun.id, 'run.created', {
+        workflowName: body.workflowName,
+        input: body.input ?? {},
+        parentRunId,
+        edgeName: body.name,
+        channels: body.channels?.map((channel) => ({
+          type: channel.type,
+          url: channel.url,
+          events: channel.events ?? []
+        })) ?? []
+      })
+      await appendEvent(client, parentRunId, 'run.child.created', {
+        childRun,
+        edge
+      })
+      return { run: childRun, edge, created: true }
+    })
+    if (!result) return c.json({ error: 'parent run not found' }, 404)
+    return c.json(result)
   })
 
   app.post('/runs/:runId/begin', async (c) => {
@@ -522,9 +674,25 @@ export function createApp() {
          returning *`,
         [runId, json(body.value ?? {})]
       )
-      await appendEvent(client, runId, 'state.updated', { value: body.value })
+      const version = await recordStateVersion(client, runId, {
+        streamName: body.stream ?? 'run',
+        targetType: 'run',
+        targetId: runId,
+        value: body.value ?? {},
+        patch: null,
+        label: body.label ?? null,
+        reason: body.reason ?? null,
+        importance: body.importance ?? 'normal',
+        metadata: body.metadata ?? {},
+        createdBy: body.createdBy ?? null
+      })
+      await appendEvent(client, runId, 'state.updated', {
+        value: body.value,
+        stateVersion: publicStateVersion(version)
+      })
       await deliverChannels(client, runId, 'state.updated', {
-        state: mapState(result.rows[0])
+        state: mapState(result.rows[0]),
+        stateVersion: publicStateVersion(version)
       })
       return mapState(result.rows[0])
     })
@@ -545,13 +713,126 @@ export function createApp() {
          returning *`,
         [runId, json(body.value ?? {})]
       )
-      await appendEvent(client, runId, 'state.updated', { value: result.rows[0].value_json })
+      const version = await recordStateVersion(client, runId, {
+        streamName: body.stream ?? 'run',
+        targetType: 'run',
+        targetId: runId,
+        value: result.rows[0].value_json,
+        patch: body.value ?? {},
+        label: body.label ?? null,
+        reason: body.reason ?? null,
+        importance: body.importance ?? 'normal',
+        metadata: body.metadata ?? {},
+        createdBy: body.createdBy ?? null
+      })
+      await appendEvent(client, runId, 'state.updated', {
+        value: result.rows[0].value_json,
+        patch: body.value ?? {},
+        stateVersion: publicStateVersion(version)
+      })
       await deliverChannels(client, runId, 'state.updated', {
-        state: mapState(result.rows[0])
+        state: mapState(result.rows[0]),
+        stateVersion: publicStateVersion(version)
       })
       return mapState(result.rows[0])
     })
     return c.json({ state })
+  })
+
+  app.post('/runs/:runId/state/save', async (c) => {
+    const runId = c.req.param('runId')
+    const body = stateSaveSchema.parse(await c.req.json())
+    const version = await tx(async (client) => {
+      const streamName = body.stream ?? 'run'
+      const current =
+        streamName === 'run'
+          ? await client.query(
+              `select value_json as value_json, 'run'::text as target_type, $1::text as target_id
+               from run_state
+               where run_id = $1`,
+              [runId]
+            )
+          : await client.query(
+              `select current_value_json as value_json, target_type, target_id
+               from state_streams
+               where run_id = $1 and name = $2`,
+              [runId, streamName]
+            )
+      if (!current.rows[0]) return null
+      const saved = await recordStateVersion(client, runId, {
+        streamName,
+        targetType: current.rows[0].target_type,
+        targetId: current.rows[0].target_id,
+        value: current.rows[0].value_json,
+        patch: null,
+        label: body.label,
+        reason: body.reason ?? null,
+        importance: body.importance ?? 'milestone',
+        metadata: body.metadata ?? {},
+        createdBy: body.createdBy ?? null
+      })
+      await appendEvent(client, runId, 'state.saved', {
+        stateVersion: publicStateVersion(saved)
+      })
+      return saved
+    })
+    if (!version) return c.json({ error: 'run state not found' }, 404)
+    return c.json({ stateVersion: version })
+  })
+
+  app.get('/runs/:runId/state/versions', async (c) => {
+    const runId = c.req.param('runId')
+    const stream = c.req.query('stream')
+    const labeled = c.req.query('labeled') === 'true'
+    const result = await pool.query(
+      `select v.*
+       from state_versions v
+       join state_streams s on s.id = v.stream_id
+       where s.run_id = $1
+         and ($2::text is null or s.name = $2)
+         and ($3::boolean = false or v.label is not null)
+       order by s.name asc, v.version asc`,
+      [runId, stream ?? null, labeled]
+    )
+    return c.json({ stateVersions: result.rows.map(mapStateVersion) })
+  })
+
+  app.post('/runs/:runId/snapshots', async (c) => {
+    const runId = c.req.param('runId')
+    const body = snapshotSchema.parse(await c.req.json())
+    const target = body.target ?? { type: 'run', id: runId }
+    const version = await tx(async (client) => {
+      const saved = await recordStateVersion(client, runId, {
+        streamName: `${target.type}:${target.id}`,
+        targetType: target.type,
+        targetId: target.id,
+        value: body.state ?? {},
+        patch: null,
+        label: body.label,
+        reason: body.reason ?? null,
+        importance: 'milestone',
+        metadata: body.metadata ?? {},
+        createdBy: body.createdBy ?? null
+      })
+      await appendEvent(client, runId, 'snapshot.created', {
+        stateVersion: publicStateVersion(saved)
+      })
+      return saved
+    })
+    return c.json({ snapshot: version })
+  })
+
+  app.get('/runs/:runId/snapshots', async (c) => {
+    const runId = c.req.param('runId')
+    const result = await pool.query(
+      `select v.*
+       from state_versions v
+       join state_streams s on s.id = v.stream_id
+       where s.run_id = $1 and v.label is not null
+       order by v.created_at desc`,
+      [runId]
+    )
+    return c.json({ snapshots: result.rows.map(mapStateVersion) })
   })
 
   app.post('/runs/:runId/usage', async (c) => {
@@ -649,7 +930,7 @@ async function dispatchRecovery(run: ReturnType<typeof mapRun>, reason: string) 
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'user-agent': 'tidebase-recovery/0.0.0',
+        'user-agent': 'tidebase-recovery/0.2.0',
         ...(signature ? { 'x-tidebase-signature': `sha256=${signature}` } : {})
       },
       body
@@ -695,6 +976,67 @@ async function dispatchRecovery(run: ReturnType<typeof mapRun>, reason: string) 
       return mapRecoveryAttempt(result.rows[0])
     })
   }
+}
+
+async function recordStateVersion(
+  client: { query: (text: string, values?: unknown[]) => Promise<{ rows: Record<string, any>[] }> },
+  runId: string,
+  options: {
+    streamName: string
+    targetType: string
+    targetId: string | null
+    value: unknown
+    patch: unknown
+    label: string | null
+    reason: string | null
+    importance: string
+    metadata: Record<string, unknown>
+    createdBy: string | null
+  }
+) {
+  const streamResult = await client.query(
+    `insert into state_streams
+      (run_id, name, target_type, target_id, current_version, current_value_json, metadata_json, updated_at)
+     values
+      ($1, $2, $3, $4, 0, '{}'::jsonb, '{}'::jsonb, now())
+     on conflict (run_id, name)
+     do update set
+      target_type = excluded.target_type,
+      target_id = excluded.target_id,
+      updated_at = now()
+     returning *`,
+    [runId, options.streamName, options.targetType, options.targetId]
+  )
+  const stream = streamResult.rows[0]
+  const nextVersion = Number(stream.current_version) + 1
+  const versionResult = await client.query(
+    `insert into state_versions
+      (stream_id, run_id, version, value_json, patch_json, label, reason, importance, metadata_json, created_by)
+     values
+      ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     returning *`,
+    [
+      stream.id,
+      runId,
+      nextVersion,
+      json(options.value ?? {}),
+      options.patch == null ? null : json(options.patch),
+      options.label,
+      options.reason,
+      options.importance,
+      json(options.metadata ?? {}),
+      options.createdBy
+    ]
+  )
+  await client.query(
+    `update state_streams
+     set current_version = $2,
+         current_value_json = $3,
+         updated_at = now()
+     where id = $1`,
+    [stream.id, nextVersion, json(options.value ?? {})]
+  )
+  return mapStateVersion(versionResult.rows[0])
 }
 
 function mapRun(row: Record<string, any>) {
@@ -756,7 +1098,7 @@ async function deliverChannels(
         method: 'POST',
         headers: {
           'content-type': 'application/json',
-          'user-agent': 'tidebase-channel/0.0.0',
+          'user-agent': 'tidebase-channel/0.2.0',
           ...(secret
             ? { 'x-tidebase-signature': `sha256=${createHmac('sha256', secret).update(body).digest('hex')}` }
             : {})
@@ -982,6 +1324,64 @@ function mapState(row: Record<string, any>) {
     value: row.value_json,
     version: Number(row.version),
     updatedAt: row.updated_at.toISOString()
+  }
+}
+
+function mapStateStream(row: Record<string, any>) {
+  return {
+    id: row.id as string,
+    runId: row.run_id as string | null,
+    name: row.name as string,
+    targetType: row.target_type as string,
+    targetId: row.target_id as string | null,
+    currentVersion: Number(row.current_version),
+    currentValue: row.current_value_json,
+    metadata: row.metadata_json,
+    createdAt: row.created_at.toISOString(),
+    updatedAt: row.updated_at.toISOString()
+  }
+}
+
+function mapStateVersion(row: Record<string, any>) {
+  return {
+    id: row.id as string,
+    streamId: row.stream_id as string,
+    runId: row.run_id as string | null,
+    stepId: row.step_id as string | null,
+    version: Number(row.version),
+    value: row.value_json,
+    patch: row.patch_json,
+    label: row.label as string | null,
+    reason: row.reason as string | null,
+    importance: row.importance as string,
+    metadata: row.metadata_json,
+    createdBy: row.created_by as string | null,
+    createdAt: row.created_at.toISOString()
+  }
+}
+
+function publicStateVersion(version: ReturnType<typeof mapStateVersion>) {
+  return {
+    id: version.id,
+    streamId: version.streamId,
+    runId: version.runId,
+    version: version.version,
+    label: version.label,
+    reason: version.reason,
+    importance: version.importance,
+    createdAt: version.createdAt
+  }
+}
+
+function mapRunEdge(row: Record<string, any>) {
+  return {
+    id: (row.edge_id ?? row.id) as string,
+    parentRunId: (row.edge_parent_run_id ?? row.parent_run_id) as string,
+    childRunId: (row.edge_child_run_id ?? row.child_run_id) as string,
+    name: (row.edge_name ?? row.name) as string,
+    edgeType: (row.edge_edge_type ?? row.edge_type) as string,
+    metadata: row.edge_metadata_json ?? row.metadata_json,
+    createdAt: (row.edge_created_at ?? row.created_at).toISOString()
   }
 }
 

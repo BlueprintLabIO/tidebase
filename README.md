@@ -137,6 +137,73 @@ Tidebase records that contract with the step and shows it in Studio. Final step 
 
 This does not make external systems exactly-once. It makes the resume decision explicit instead of hiding it in logs and custom retry flags.
 
+## Versioned State And Snapshots
+
+`run.state.set()` and `run.state.patch()` still update the current live run state. In v0.2 they also append a version to Tidebase's state history.
+
+```typescript
+await run.state.patch({
+  status: 'writing',
+  progress: 0.7
+})
+```
+
+You can label the current state when it becomes a meaningful review or restore point:
+
+```typescript
+await run.state.save('before-approval', {
+  reason: 'the user is about to approve sending'
+})
+```
+
+Snapshots are a convenience API over labeled state versions for external targets such as reports, artifacts, workspaces, documents, or app state:
+
+```typescript
+await run.snapshots.create('draft-v1', {
+  target: { type: 'report', id: reportId },
+  state: draft,
+  reason: 'first complete draft'
+})
+```
+
+The model is intentionally small:
+
+```text
+current state = latest version in a stream
+snapshot = labeled state version
+time travel = read an older version
+fork = create new app/run context from an older version
+restore = append a new version based on an older version
+```
+
+Tidebase stores and exposes the versions. Your app decides what restore or fork means for its own state targets.
+
+## Child Runs And Fanout
+
+Longer agent workflows often fan out to subagents and rejoin their results. Tidebase v0.2 models that as parent/child run edges plus a checkpointed join step.
+
+```typescript
+const results = await run.fanout('research-options', [
+  {
+    name: 'flights',
+    workflow: researchFlights,
+    input: { destination }
+  },
+  {
+    name: 'hotels',
+    workflow: researchHotels,
+    input: { destination }
+  },
+  {
+    name: 'food',
+    workflow: researchFood,
+    input: { destination }
+  }
+])
+```
+
+Child run creation is idempotent by parent run and edge name. If the parent resumes, Tidebase returns the existing child runs instead of creating duplicates. The joined result is stored in a normal checkpointed step named `join:<fanout-name>`.
+
 ## Gates And Channels
 
 Channels deliver Tidebase events to external surfaces. The alpha supports webhook channels:
@@ -246,7 +313,10 @@ await run.usage.record({
 - named checkpointed steps
 - input hashes to prevent stale checkpoint reuse
 - step resume contracts
-- live state snapshots
+- live run state
+- versioned state streams
+- labeled state versions and snapshots
+- parent/child run edges
 - append-only run events
 - recovery attempts
 - webhook channel deliveries
@@ -262,6 +332,8 @@ Everything is backed by Postgres and designed for self-hosting from day one.
 - TypeScript SDK
 - SvelteKit Studio
 - live state set/patch
+- state history and labeled snapshots
+- child runs and fanout joins
 - SSE event stream
 - signed recovery webhooks
 - webhook channels
