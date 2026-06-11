@@ -11,6 +11,7 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-0aabc0.svg" alt="License: Apache-2.0"></a>
   <a href="https://github.com/BlueprintLabIO/tidebase/releases"><img src="https://img.shields.io/github/v/release/BlueprintLabIO/tidebase?color=0aabc0" alt="Latest release"></a>
+  <a href="https://github.com/BlueprintLabIO/tidebase/actions/workflows/ci.yml"><img src="https://github.com/BlueprintLabIO/tidebase/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/SDK-TypeScript-0e6f80.svg" alt="TypeScript SDK">
   <img src="https://img.shields.io/badge/storage-Postgres-0e6f80.svg" alt="Postgres storage">
 </p>
@@ -91,6 +92,28 @@ The `plan` and `fetch-sources` steps are returned from checkpoints. Only `write-
 <p align="center">
   <img src="docs/assets/crash-resume.gif" width="820" alt="Kill the process mid-run, re-invoke with the same run id, and the workflow resumes from the last checkpoint">
 </p>
+
+## Testing
+
+```bash
+pnpm test
+```
+
+The suite (57 tests, run in CI on every push) uses the same Postgres in an isolated `tidebase_test` database. It is invariant-driven rather than coverage-driven: every test asserts a durability or safety guarantee through the public API or SDK, against real Postgres, including concurrency probes for the guarantees that only matter under contention.
+
+What it proves:
+
+- completed steps replay from storage and never re-execute, including across crash + recovery-webhook resume
+- step and run leases are mutually exclusive and fenced — zombie workers cannot write back stale results
+- input-hash drift on replay is rejected before it can corrupt a run
+- failure classification honors the resume contract: unkeyed external writes park in `manual_review`, idempotency-keyed and read-only steps are `safe_replay`
+- per-run event logs are gap-free and strictly ordered under concurrent writers
+- gates resolve exactly once, require the resolve token, and replay their decision on resume
+- child runs are idempotent by edge name, so resumed fanouts reuse children
+- recovery webhooks and channel deliveries are HMAC-signed; the SDK rejects unsigned, tampered, or forged payloads
+- a slow or hung channel endpoint never blocks other writers to the run
+
+See [docs/testing.md](docs/testing.md) for the full invariant map and conventions.
 
 ## API Shape
 

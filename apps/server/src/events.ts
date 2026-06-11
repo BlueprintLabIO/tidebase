@@ -30,6 +30,9 @@ export async function appendEvent(
   type: string,
   payload: unknown
 ) {
+  // Serialize event writers per run: max(seq) + 1 is computed per transaction, so
+  // concurrent writers would otherwise collide on unique(run_id, seq).
+  await client.query('select pg_advisory_xact_lock(hashtext($1))', [runId])
   const seqResult = await client.query<{ next_seq: string }>(
     'select coalesce(max(seq), 0) + 1 as next_seq from events where run_id = $1',
     [runId]

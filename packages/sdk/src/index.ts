@@ -428,27 +428,29 @@ export class RunContext {
     if (!fn) throw new Error(`Missing function for step ${name}`)
 
     const inputHash = options.inputHash ?? hashStable(options.input ?? null)
-    const begin = await this.client.request<
-      | { action: 'return'; output: TResult }
-      | { action: 'execute'; step: { id: string }; leaseOwner: string }
-      | { action: 'locked'; step: { id: string; name: string } }
-      | {
-          action: 'input_mismatch'
-          step: { id: string; name: string }
-          expectedInputHash: string
-          actualInputHash: string
-        }
-    >(`/runs/${this.runId}/steps/begin`, {
-      method: 'POST',
-      body: JSON.stringify({
-        name,
-        inputHash,
-        input: options.input ?? null,
-        options,
-        leaseOwner: this.leaseOwner
+    const beginStep = () =>
+      this.client.request<
+        | { action: 'return'; output: TResult }
+        | { action: 'execute'; step: { id: string }; leaseOwner: string }
+        | { action: 'locked'; step: { id: string; name: string } }
+        | {
+            action: 'input_mismatch'
+            step: { id: string; name: string }
+            expectedInputHash: string
+            actualInputHash: string
+          }
+      >(`/runs/${this.runId}/steps/begin`, {
+        method: 'POST',
+        body: JSON.stringify({
+          name,
+          inputHash,
+          input: options.input ?? null,
+          options,
+          leaseOwner: this.leaseOwner
+        })
       })
-    })
 
+    const begin = await beginStep()
     if (begin.action === 'return') return begin.output
     if (begin.action === 'input_mismatch') {
       throw new Error(
@@ -460,15 +462,31 @@ export class RunContext {
     }
 
     const attempts = Math.max(1, (options.retries ?? 0) + 1)
+    let current = begin
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      if (attempt > 1) {
+        // A retryable failure releases the lease server-side, so each retry must
+        // re-begin the step to acquire a fresh lease before reporting results.
+        const again = await beginStep()
+        if (again.action === 'return') return again.output
+        if (again.action === 'locked') {
+          throw new Error(`Step ${name} is currently leased by another worker`)
+        }
+        if (again.action === 'input_mismatch') {
+          throw new Error(
+            `Step ${name} input hash changed for this run. Expected ${again.expectedInputHash}, got ${again.actualInputHash}`
+          )
+        }
+        current = again
+      }
       try {
         const result = await withTimeout(fn(), options.timeoutMs)
         await this.client.request(
-          `/runs/${this.runId}/steps/${begin.step.id}/complete`,
+          `/runs/${this.runId}/steps/${current.step.id}/complete`,
           {
             method: 'POST',
             body: JSON.stringify({
-              leaseOwner: begin.leaseOwner,
+              leaseOwner: current.leaseOwner,
               output: result
             })
           }
@@ -476,10 +494,10 @@ export class RunContext {
         return result
       } catch (error) {
         const retryable = attempt < attempts
-        await this.client.request(`/runs/${this.runId}/steps/${begin.step.id}/fail`, {
+        await this.client.request(`/runs/${this.runId}/steps/${current.step.id}/fail`, {
           method: 'POST',
           body: JSON.stringify({
-            leaseOwner: begin.leaseOwner,
+            leaseOwner: current.leaseOwner,
             retryable,
             resumeDecision: retryable ? 'auto_retry' : classifyResumeDecision(options),
             error: serializeError(error)
@@ -617,14 +635,20 @@ function classifyResumeDecision(options: StepOptions) {
   if (options.replay === 'auto' || options.onAmbiguousFailure === 'retry') {
     return 'safe_replay'
   }
+  // Mirrors the server's inferReplay: steps without declared side effects (or
+  // read-only ones) are presumed safe to replay; external writes need an
+  // idempotency key to qualify.
   const namedSideEffects = options.sideEffects?.filter(Boolean) ?? []
   const legacySideEffect = options.sideEffect ?? 'none'
+  const readsOnly = namedSideEffects.length > 0 && namedSideEffects.every((effect) => effect === 'read')
   const writesExternally =
-    namedSideEffects.length > 0 || legacySideEffect === 'write' || legacySideEffect === 'external'
+    (namedSideEffects.length > 0 && !readsOnly) ||
+    legacySideEffect === 'write' ||
+    legacySideEffect === 'external'
   if (writesExternally && !options.idempotencyKey) {
     return 'manual_review'
   }
-  return 'fail_hard'
+  return 'safe_replay'
 }
 
 export class RunUsage {

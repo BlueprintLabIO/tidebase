@@ -121,6 +121,13 @@ const gateResolveSchema = z.object({
 export function createApp() {
   const app = new Hono()
   app.use('*', cors())
+  app.onError((error, c) => {
+    if (error instanceof z.ZodError) {
+      return c.json({ error: 'invalid request body', issues: error.issues }, 400)
+    }
+    console.error(error)
+    return c.json({ error: 'internal server error' }, 500)
+  })
 
   app.get('/health', (c) => c.json({ ok: true }))
 
@@ -381,17 +388,20 @@ export function createApp() {
       await appendEvent(client, runId, 'run.completed', {
         result: body.result ?? null
       })
-      await deliverChannels(client, runId, 'run.completed', { run: mapRun(update.rows[0]) })
-      return mapRun(update.rows[0])
+      const deliveries = await queueChannelDeliveries(client, runId, 'run.completed', {
+        run: mapRun(update.rows[0])
+      })
+      return { run: mapRun(update.rows[0]), deliveries }
     })
     if (!result) return c.json({ error: 'run not found' }, 404)
-    return c.json({ run: result })
+    await dispatchChannelDeliveries(result.deliveries)
+    return c.json({ run: result.run })
   })
 
   app.post('/runs/:runId/fail', async (c) => {
     const runId = c.req.param('runId')
     const body = await c.req.json()
-    const run = await tx(async (client) => {
+    const result = await tx(async (client) => {
       const update = await client.query(
         `update runs
          set status = 'failed',
@@ -405,27 +415,34 @@ export function createApp() {
       )
       if (!update.rows[0]) return null
       await appendEvent(client, runId, 'run.failed', { error: body.error ?? {} })
-      await deliverChannels(client, runId, 'run.failed', {
+      const deliveries = await queueChannelDeliveries(client, runId, 'run.failed', {
         run: mapRun(update.rows[0]),
         error: body.error ?? {}
       })
-      return mapRun(update.rows[0])
+      return { run: mapRun(update.rows[0]), deliveries }
     })
-    if (!run) return c.json({ error: 'run not found' }, 404)
-    await dispatchRecovery(run, 'run_failed')
-    return c.json({ run })
+    if (!result) return c.json({ error: 'run not found' }, 404)
+    await dispatchChannelDeliveries(result.deliveries)
+    await dispatchRecovery(result.run, 'run_failed')
+    return c.json({ run: result.run })
   })
 
   app.post('/runs/:runId/gates/begin', async (c) => {
     const runId = c.req.param('runId')
     const body = gateBeginSchema.parse(await c.req.json())
     const result = await tx(async (client) => {
+      // Same gap as steps/begin: concurrent first-begins would both insert and
+      // one would abort on unique(run_id, name).
+      await client.query(
+        `select pg_advisory_xact_lock(hashtext($1 || ':gate:' || $2))`,
+        [runId, body.name]
+      )
       const existing = await client.query(
         `select * from gates where run_id = $1 and name = $2 for update`,
         [runId, body.name]
       )
       if (existing.rows[0]) {
-        return mapGate(existing.rows[0])
+        return { gate: mapGate(existing.rows[0]), deliveries: [] as QueuedChannelDelivery[] }
       }
 
       const inserted = await client.query(
@@ -445,10 +462,18 @@ export function createApp() {
       await appendEvent(client, runId, 'gate.created', {
         gate: publicGate(gate)
       })
-      await deliverChannels(client, runId, 'gate.created', { gate: publicGate(gate) }, body.channels ?? [], gate.id)
-      return gate
+      const deliveries = await queueChannelDeliveries(
+        client,
+        runId,
+        'gate.created',
+        { gate: publicGate(gate) },
+        body.channels ?? [],
+        gate.id
+      )
+      return { gate, deliveries }
     })
-    return c.json({ action: result.status === 'pending' ? 'wait' : 'return', gate: result })
+    await dispatchChannelDeliveries(result.deliveries)
+    return c.json({ action: result.gate.status === 'pending' ? 'wait' : 'return', gate: result.gate })
   })
 
   app.get('/runs/:runId/gates/:gateId', async (c) => {
@@ -489,11 +514,19 @@ export function createApp() {
       await appendEvent(client, runId, 'gate.resolved', {
         gate: publicGate(resolved)
       })
-      await deliverChannels(client, runId, 'gate.resolved', { gate: publicGate(resolved) }, resolved.channels, gateId)
-      return resolved
+      const deliveries = await queueChannelDeliveries(
+        client,
+        runId,
+        'gate.resolved',
+        { gate: publicGate(resolved) },
+        resolved.channels,
+        gateId
+      )
+      return { gate: resolved, deliveries }
     })
     if (!gate) return c.json({ error: 'gate not found, already resolved, or invalid token' }, 409)
-    return c.json({ gate })
+    await dispatchChannelDeliveries(gate.deliveries)
+    return c.json({ gate: gate.gate })
   })
 
   app.post('/runs/:runId/recover', async (c) => {
@@ -515,6 +548,12 @@ export function createApp() {
     const leaseOwner = body.leaseOwner ?? randomUUID()
 
     const result = await tx(async (client) => {
+      // `for update` cannot lock a row that does not exist yet, so concurrent
+      // first-begins of the same step would race past the lease check below.
+      await client.query(
+        `select pg_advisory_xact_lock(hashtext($1 || ':step:' || $2))`,
+        [runId, body.name]
+      )
       const existing = await client.query(
         `select * from steps where run_id = $1 and name = $2 for update`,
         [runId, body.name]
@@ -648,16 +687,17 @@ export function createApp() {
         resumeContract: normalizeResumeContract(update.rows[0].options_json),
         error: body.error
       })
-      await deliverChannels(client, runId, 'step.failed', {
+      const deliveries = await queueChannelDeliveries(client, runId, 'step.failed', {
         step: mapStep(update.rows[0]),
         retryable: body.retryable ?? false,
         resumeDecision,
         error: body.error
       })
-      return mapStep(update.rows[0])
+      return { step: mapStep(update.rows[0]), deliveries }
     })
     if (!result) return c.json({ error: 'step not found or lease lost' }, 409)
-    return c.json({ step: result })
+    await dispatchChannelDeliveries(result.deliveries)
+    return c.json({ step: result.step })
   })
 
   app.put('/runs/:runId/state', async (c) => {
@@ -690,13 +730,14 @@ export function createApp() {
         value: body.value,
         stateVersion: publicStateVersion(version)
       })
-      await deliverChannels(client, runId, 'state.updated', {
+      const deliveries = await queueChannelDeliveries(client, runId, 'state.updated', {
         state: mapState(result.rows[0]),
         stateVersion: publicStateVersion(version)
       })
-      return mapState(result.rows[0])
+      return { state: mapState(result.rows[0]), deliveries }
     })
-    return c.json({ state })
+    await dispatchChannelDeliveries(state.deliveries)
+    return c.json({ state: state.state })
   })
 
   app.patch('/runs/:runId/state', async (c) => {
@@ -730,13 +771,14 @@ export function createApp() {
         patch: body.value ?? {},
         stateVersion: publicStateVersion(version)
       })
-      await deliverChannels(client, runId, 'state.updated', {
+      const deliveries = await queueChannelDeliveries(client, runId, 'state.updated', {
         state: mapState(result.rows[0]),
         stateVersion: publicStateVersion(version)
       })
-      return mapState(result.rows[0])
+      return { state: mapState(result.rows[0]), deliveries }
     })
-    return c.json({ state })
+    await dispatchChannelDeliveries(state.deliveries)
+    return c.json({ state: state.state })
   })
 
   app.post('/runs/:runId/state/save', async (c) => {
@@ -863,10 +905,13 @@ export function createApp() {
       )
       const record = mapUsageRecord(result.rows[0])
       await appendEvent(client, runId, 'usage.recorded', { usage: record })
-      await deliverChannels(client, runId, 'usage.recorded', { usage: record })
-      return record
+      const deliveries = await queueChannelDeliveries(client, runId, 'usage.recorded', {
+        usage: record
+      })
+      return { usage: record, deliveries }
     })
-    return c.json({ usage })
+    await dispatchChannelDeliveries(usage.deliveries)
+    return c.json({ usage: usage.usage })
   })
 
   app.get('/runs/:runId/events', async (c) => {
@@ -930,7 +975,7 @@ async function dispatchRecovery(run: ReturnType<typeof mapRun>, reason: string) 
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'user-agent': 'tidebase-recovery/0.2.0',
+        'user-agent': 'tidebase-recovery/0.3.0',
         ...(signature ? { 'x-tidebase-signature': `sha256=${signature}` } : {})
       },
       body
@@ -1062,20 +1107,34 @@ function json(value: unknown) {
   return JSON.stringify(value)
 }
 
-async function deliverChannels(
+type QueuedChannelDelivery = {
+  deliveryId: string
+  runId: string
+  gateId: string | null
+  eventType: string
+  payload: unknown
+  url: string
+  secret: string | null
+}
+
+// Runs inside the endpoint transaction: selects matching channels and records
+// pending delivery rows. The actual HTTP dispatch happens after commit via
+// dispatchChannelDeliveries so a slow webhook never holds row or event locks.
+async function queueChannelDeliveries(
   client: { query: (text: string, values?: unknown[]) => Promise<{ rows: Record<string, any>[] }> },
   runId: string,
   eventType: string,
   payload: unknown,
   inlineChannels: unknown[] = [],
   gateId: string | null = null
-) {
+): Promise<QueuedChannelDelivery[]> {
   const stored = await client.query('select * from channels where run_id = $1', [runId])
   const channels = [
     ...stored.rows.map(mapChannel),
     ...inlineChannels.map((channel) => normalizeInlineChannel(channel)).filter((channel): channel is ReturnType<typeof normalizeInlineChannel> & {} => Boolean(channel))
   ].filter((channel) => channelMatchesEvent(channel, eventType))
 
+  const queued: QueuedChannelDelivery[] = []
   for (const channel of channels) {
     if (channel.type !== 'webhook') continue
     const delivery = await client.query(
@@ -1084,45 +1143,58 @@ async function deliverChannels(
        returning *`,
       [runId, 'id' in channel ? channel.id : null, gateId, eventType, json(payload ?? {})]
     )
-    const deliveryId = delivery.rows[0].id as string
+    queued.push({
+      deliveryId: delivery.rows[0].id as string,
+      runId,
+      gateId,
+      eventType,
+      payload,
+      url: channel.config.url,
+      secret: channel.config.secret
+    })
+  }
+  return queued
+}
+
+async function dispatchChannelDeliveries(deliveries: QueuedChannelDelivery[]) {
+  for (const delivery of deliveries) {
     try {
       const body = JSON.stringify({
-        type: eventType,
-        runId,
-        gateId,
-        deliveryId,
-        payload
+        type: delivery.eventType,
+        runId: delivery.runId,
+        gateId: delivery.gateId,
+        deliveryId: delivery.deliveryId,
+        payload: delivery.payload
       })
-      const secret = channel.config.secret
-      const response = await fetch(channel.config.url, {
+      const response = await fetch(delivery.url, {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
-          'user-agent': 'tidebase-channel/0.2.0',
-          ...(secret
-            ? { 'x-tidebase-signature': `sha256=${createHmac('sha256', secret).update(body).digest('hex')}` }
+          'user-agent': 'tidebase-channel/0.3.0',
+          ...(delivery.secret
+            ? { 'x-tidebase-signature': `sha256=${createHmac('sha256', delivery.secret).update(body).digest('hex')}` }
             : {})
         },
         body
       })
       const responseBody = await response.text()
-      await client.query(
+      await pool.query(
         `update channel_deliveries
          set status = $2,
              http_status = $3,
              response_body = $4,
              completed_at = now()
          where id = $1`,
-        [deliveryId, response.ok ? 'delivered' : 'failed', response.status, responseBody.slice(0, 8000)]
+        [delivery.deliveryId, response.ok ? 'delivered' : 'failed', response.status, responseBody.slice(0, 8000)]
       )
     } catch (error) {
-      await client.query(
+      await pool.query(
         `update channel_deliveries
          set status = 'failed',
              error_text = $2,
              completed_at = now()
          where id = $1`,
-        [deliveryId, error instanceof Error ? error.message : String(error)]
+        [delivery.deliveryId, error instanceof Error ? error.message : String(error)]
       )
     }
   }
