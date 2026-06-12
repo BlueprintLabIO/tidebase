@@ -1,0 +1,22 @@
+{
+  "name": "tidebase",
+  "version": "0.5.0",
+  "description": "CLI shim for Tidebase — `npx tidebase init` writes a Tidebase usage section into AGENTS.md/CLAUDE.md so AI coding agents use the checkpoint layer correctly. Full SDK: @tidebase/sdk",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "tidebase": "cli.js"
+  },
+  "files": [
+    "cli.js"
+  ],
+  "scripts": {
+    "prepublishOnly": "cp ../sdk/dist/cli.js ./cli.js"
+  },
+  "homepage": "https://tidebase.dev",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/BlueprintLabIO/tidebase"
+  },
+  "keywords": ["tidebase", "ai-agents", "checkpoint", "cli"]
+}
