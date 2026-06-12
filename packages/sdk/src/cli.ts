@@ -79,6 +79,6 @@ const command = process.argv[2]
 if (command === 'init') {
   init()
 } else {
-  console.log('Usage: tidebase init')
+  console.log('Usage: npx @tidebase/sdk init')
   if (command) process.exitCode = 1
 }
