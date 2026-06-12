@@ -482,11 +482,13 @@ Everything is backed by Postgres and designed for self-hosting from day one.
 
 ## Not In This Alpha
 
-- Tidebase-hosted code execution (your runtime stays yours)
+As of **v0.6.0 (June 2026)**. Earlier alphas listed queues, schedules, cancellation, approval gates, and API auth here — those shipped in v0.5–v0.6 (durable queues with retries/backoff, cron, authoritative cancel, exactly-once gates, session runs, opt-in bearer auth, and a reconciler that detects dead workers and re-dispatches automatically). What remains deliberately out of scope:
+
+- Tidebase-hosted code execution (your runtime stays yours — this one is permanent, not pending)
 - LLM gateway/proxying
 - hosted channel adapters
 - secret custody or credential brokering
-- memory
+- agent memory (conversation or embedding storage)
 - multi-tenant auth (single shared API key today)
 - hosted cloud
 
