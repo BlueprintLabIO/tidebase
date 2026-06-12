@@ -207,6 +207,8 @@ await session.complete({ calls: 12 }) // or session.fail(err)
 
 The session holds the run lease with a background heartbeat (`heartbeatMs`, default 20s). If the process dies, the heartbeat stops, the lease expires, and the reconciler takes over — requeue or recovery webhook, exactly as if a workflow worker had crashed. A session that loses its lease (`onLeaseLost`) is a zombie: the server fences its writes. Pass `runId` to resume an existing session's run; completed steps replay from storage.
 
+For a complete worked example — an MCP gateway that wraps any agent's MCP server in checkpointed tool calls and durable approval gates with one config-line change — see [`examples/mcp-gateway/`](examples/mcp-gateway/).
+
 ## Resume Contracts
 
 Each step can declare the operational contract Tidebase should record for replay:
