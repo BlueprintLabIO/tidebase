@@ -100,7 +100,7 @@ The `plan` and `fetch-sources` steps are returned from checkpoints. Only `write-
 Make every AI session in your project use Tidebase correctly:
 
 ```bash
-npx tidebase init        # writes a Tidebase section into AGENTS.md/CLAUDE.md (idempotent)
+npx @tidebase/sdk init        # writes a Tidebase section into AGENTS.md/CLAUDE.md (idempotent)
 ```
 
 Give your assistant direct access to runs, gates, and recovery via MCP:
