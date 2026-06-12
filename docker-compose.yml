@@ -10,5 +10,17 @@ services:
     volumes:
       - tidebase-postgres:/var/lib/postgresql/data
 
+  # Prebuilt server image — no Node required:
+  #   docker compose --profile server up -d
+  server:
+    image: ghcr.io/blueprintlabio/tidebase:latest
+    profiles: [server]
+    environment:
+      DATABASE_URL: postgres://tidebase:tidebase@postgres:5432/tidebase
+    ports:
+      - "7373:7373"
+    depends_on:
+      - postgres
+
 volumes:
   tidebase-postgres:
