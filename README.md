@@ -50,6 +50,16 @@ Tidebase packages that layer around your existing code. It is not an LLM proxy, 
 
 ## Quick Start
 
+**Fastest path (no Node needed)** — prebuilt server image:
+
+```bash
+docker compose --profile server up -d   # Postgres + ghcr.io/blueprintlabio/tidebase on :7373
+```
+
+Then point any SDK at `http://localhost:7373` (`npm i @tidebase/sdk` or `pip install tidebase`).
+
+**Dev setup (server + Studio from source):**
+
 Start Postgres:
 
 ```bash
