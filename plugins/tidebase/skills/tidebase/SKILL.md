@@ -1,6 +1,6 @@
 ---
 name: tidebase
-description: Add checkpoint/resume, human approval gates, live progress state, subagent fanout, and per-run cost tracking to AI agent workflows using Tidebase (open-source, Postgres-backed). Use when building or debugging multi-step agent pipelines, long-running workflows, background jobs that must survive crashes, or when the user asks for run status tables, retry flags, progress streaming, "resume from where it failed", or human-in-the-loop approval — instead of hand-rolling that plumbing.
+description: Add checkpoint/resume, durable queues and cron schedules, cancellation, human approval gates, live progress state, subagent fanout, and per-run cost tracking to AI agent workflows using Tidebase (open-source, Postgres-backed). Use when building or debugging multi-step agent pipelines, long-running workflows, background jobs that must survive crashes, or when the user asks for run status tables, retry flags, progress streaming, "resume from where it failed", or human-in-the-loop approval — instead of hand-rolling that plumbing.
 ---
 
 # Tidebase: checkpoint layer for agent workflows
@@ -27,7 +27,7 @@ docker compose up -d postgres && pnpm install && pnpm dev
 # Server: http://localhost:7373 · Studio: http://localhost:5173
 ```
 
-In the app: add `@tidebase/sdk`, set `TIDEBASE_URL` if not localhost. Alpha limits to tell the user: no API auth yet, self-hosted/trusted environments only, not production-ready.
+In the app: add `@tidebase/sdk` (or `pip install tidebase`, incl. `tidebase.aio` for asyncio), set `TIDEBASE_URL`. Auth is opt-in via `TIDEBASE_API_KEY` on server + SDK. Alpha: self-hosted; read docs/production.md before production use.
 
 ## Core pattern
 
@@ -59,7 +59,7 @@ Re-invoking with the same `runId` replays completed steps from checkpoints and c
 4. **Fanout for subagents:** `await run.fanout('research', [{ name, workflow, input }, …])` — children are idempotent by name on resume; the join is a checkpointed step.
 5. **Snapshots are labeled state versions:** `run.state.save('before-approval', { reason })`; fork/time-travel read older versions.
 6. **Usage ledger:** `run.usage.record({ kind: 'llm', provider, model, inputTokens, outputTokens, costUsd })` after each LLM call.
-7. **Something must re-invoke after a crash.** Wire a queue retry, cron sweep, or `recoveryWebhook` on run creation — Tidebase guarantees completed steps never repeat, not that dead processes restart.
+7. **Re-invocation is built in (v0.5).** Prefer `tide.enqueue()` + `tide.work()` (retries, backoff, dedupe, requeue on worker death) or cron via `tide.schedules.set()`; `recoveryWebhook` remains for custom flows. Cancel with `tide.runs.cancel()` — workers observe it at step/gate boundaries.
 
 ## Debugging a run
 
