@@ -1,0 +1,25 @@
+{
+  "name": "@tidebase/example-mcp-gateway",
+  "private": true,
+  "version": "0.6.0",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "tidebase-wrap": "src/gateway.ts"
+  },
+  "scripts": {
+    "start": "tsx src/gateway.ts",
+    "smoke": "tsx src/smoke.ts",
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@tidebase/sdk": "workspace:*",
+    "tsx": "^4.19.2"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/server-everything": "^2026.1.26",
+    "typescript": "^5.7.3"
+  }
+}
