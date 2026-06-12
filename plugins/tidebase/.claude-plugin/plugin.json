@@ -1,0 +1,13 @@
+{
+  "name": "tidebase",
+  "version": "0.1.0",
+  "description": "Checkpoint/resume, human approval gates, subagent fanout, and per-run cost tracking for AI agent workflows — via the Tidebase skill and MCP server.",
+  "author": {
+    "name": "BlueprintLab",
+    "url": "https://github.com/BlueprintLabIO"
+  },
+  "homepage": "https://tidebase.dev",
+  "repository": "https://github.com/BlueprintLabIO/tidebase",
+  "license": "Apache-2.0",
+  "keywords": ["ai-agents", "checkpoint", "durable", "postgres", "workflow"]
+}

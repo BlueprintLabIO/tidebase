@@ -1,14 +1,22 @@
-import { createHmac, randomUUID } from 'node:crypto'
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { streamSSE } from 'hono/streaming'
 import { z } from 'zod'
 import { pool, tx } from './db.js'
 import { appendEvent, listEvents, subscribe } from './events.js'
+import { nextFire, parseCron } from './cron.js'
 
 const leaseMs = Number(process.env.TIDEBASE_LEASE_MS ?? 60_000)
 const webhookSecret = process.env.TIDEBASE_WEBHOOK_SECRET
 const publicUrl = (process.env.TIDEBASE_PUBLIC_URL ?? `http://localhost:${process.env.PORT ?? 7373}`).replace(/\/$/, '')
+
+function timingSafeEqualString(a: string, b: string) {
+  const aBuf = Buffer.from(a)
+  const bBuf = Buffer.from(b)
+  if (aBuf.length !== bBuf.length) return false
+  return timingSafeEqual(aBuf, bBuf)
+}
 
 const jsonRecord = z.record(z.string(), z.unknown())
 const channelSchema = z.object({
@@ -118,7 +126,57 @@ const gateResolveSchema = z.object({
   payload: z.unknown().optional()
 })
 
-export function createApp() {
+const cancelRunSchema = z.object({
+  reason: z.string().optional(),
+  actor: z.string().optional()
+})
+
+const enqueueSchema = z.object({
+  workflowName: z.string().min(1),
+  input: z.unknown().optional(),
+  metadata: jsonRecord.optional(),
+  recoveryWebhook: z.string().url().optional(),
+  channels: z.array(channelSchema).optional(),
+  dedupeKey: z.string().min(1).optional(),
+  delayMs: z.number().int().nonnegative().optional(),
+  runAt: z.string().datetime().optional(),
+  maxAttempts: z.number().int().positive().optional(),
+  priority: z.number().int().optional(),
+  deadlineMs: z.number().int().positive().optional()
+})
+
+const claimSchema = z.object({
+  queues: z.array(z.string().min(1)).min(1),
+  leaseOwner: z.string().optional(),
+  limit: z.number().int().positive().max(100).optional()
+})
+
+const queueConfigSchema = z.object({
+  concurrency: z.number().int().positive().nullable().optional(),
+  ratePerMinute: z.number().int().positive().nullable().optional(),
+  invokeUrl: z.string().url().nullable().optional()
+})
+
+const scheduleSchema = z.object({
+  cron: z.string().min(1),
+  workflowName: z.string().min(1),
+  input: z.unknown().optional(),
+  queue: z.string().min(1).optional(),
+  maxAttempts: z.number().int().positive().optional(),
+  enabled: z.boolean().optional()
+})
+
+export function retryBackoffMs(attempt: number) {
+  // 5s, 10s, 20s, … capped at 5 minutes
+  return Math.min(300_000, 5_000 * 2 ** Math.max(0, attempt - 1))
+}
+
+export type CreateAppOptions = {
+  apiKey?: string
+}
+
+export function createApp(options: CreateAppOptions = {}) {
+  const apiKey = options.apiKey ?? process.env.TIDEBASE_API_KEY
   const app = new Hono()
   app.use('*', cors())
   app.onError((error, c) => {
@@ -130,6 +188,22 @@ export function createApp() {
   })
 
   app.get('/health', (c) => c.json({ ok: true }))
+
+  // Shared-token auth: opt-in by setting TIDEBASE_API_KEY. /health stays open
+  // for probes. The SSE endpoint also accepts ?token= because EventSource
+  // cannot set request headers.
+  if (apiKey) {
+    app.use('*', async (c, next) => {
+      const header = c.req.header('authorization')
+      const bearer = header?.startsWith('Bearer ') ? header.slice('Bearer '.length) : null
+      const isEventStream = /^\/runs\/[^/]+\/events$/.test(c.req.path)
+      const candidate = bearer ?? (isEventStream ? c.req.query('token') ?? null : null)
+      if (!candidate || !timingSafeEqualString(candidate, apiKey)) {
+        return c.json({ error: 'unauthorized' }, 401)
+      }
+      await next()
+    })
+  }
 
   app.post('/runs/:workflowName', async (c) => {
     const workflowName = c.req.param('workflowName')
@@ -178,6 +252,274 @@ export function createApp() {
       'select * from runs order by created_at desc limit 100'
     )
     return c.json({ runs: result.rows.map(mapRun) })
+  })
+
+  // ---- lifecycle: cancellation ----------------------------------------
+  // Cancellation is authoritative and one-way: status flips to 'cancelled'
+  // immediately (externally observable), in-flight workers discover it at
+  // their next step/gate boundary, and complete/fail can never resurrect a
+  // cancelled run. Idempotent: cancelling twice returns the same run.
+  app.post('/runs/:runId/cancel', async (c) => {
+    const runId = c.req.param('runId')
+    const body = cancelRunSchema.parse(await c.req.json().catch(() => ({})))
+    const result = await tx(async (client) => {
+      const existing = await client.query('select * from runs where id = $1 for update', [runId])
+      const row = existing.rows[0]
+      if (!row) return null
+      if (row.status === 'cancelled') return { run: mapRun(row), deliveries: [] as QueuedChannelDelivery[], already: true }
+      if (row.status === 'completed') {
+        return { run: mapRun(row), deliveries: [] as QueuedChannelDelivery[], terminal: true }
+      }
+      const update = await client.query(
+        `update runs
+         set status = 'cancelled',
+             cancel_requested_at = coalesce(cancel_requested_at, now()),
+             cancelled_at = now(),
+             cancel_reason = $2,
+             cancel_actor = $3,
+             lease_owner = null,
+             lease_expires_at = null,
+             completed_at = now(),
+             updated_at = now()
+         where id = $1
+         returning *`,
+        [runId, body.reason ?? null, body.actor ?? null]
+      )
+      const run = mapRun(update.rows[0])
+      await appendEvent(client, runId, 'run.cancelled', {
+        reason: body.reason ?? null,
+        actor: body.actor ?? null
+      })
+      const deliveries = await queueChannelDeliveries(client, runId, 'run.cancelled', { run })
+      return { run, deliveries }
+    })
+    if (!result) return c.json({ error: 'run not found' }, 404)
+    if ('terminal' in result) {
+      return c.json({ error: 'run already completed', run: result.run }, 409)
+    }
+    await dispatchChannelDeliveries(result.deliveries)
+    return c.json({ run: result.run })
+  })
+
+  // ---- queues -----------------------------------------------------------
+  // A queued job IS a run (status 'queued'): one lifecycle authority, no
+  // parallel job table to drift. Dedupe is enforced by a partial unique
+  // index over active runs.
+  app.post('/queues/:queue/enqueue', async (c) => {
+    const queue = c.req.param('queue')
+    const body = enqueueSchema.parse(await c.req.json())
+    const runAt = body.runAt
+      ? new Date(body.runAt)
+      : new Date(Date.now() + (body.delayMs ?? 0))
+    const deadlineAt = body.deadlineMs ? new Date(Date.now() + body.deadlineMs) : null
+    try {
+      const result = await tx(async (client) => {
+        const inserted = await client.query(
+          `insert into runs (workflow_name, input_json, metadata_json, recovery_webhook,
+                             status, queue_name, dedupe_key, priority, run_at, max_attempts, deadline_at)
+           values ($1, $2, $3, $4, 'queued', $5, $6, $7, $8, $9, $10)
+           returning *`,
+          [
+            body.workflowName,
+            json(body.input ?? {}),
+            json(body.metadata ?? {}),
+            body.recoveryWebhook ?? null,
+            queue,
+            body.dedupeKey ?? null,
+            body.priority ?? 0,
+            runAt,
+            body.maxAttempts ?? 1,
+            deadlineAt
+          ]
+        )
+        const run = mapRun(inserted.rows[0])
+        for (const channel of body.channels ?? []) {
+          await client.query(
+            `insert into channels (run_id, type, config_json, events_json)
+             values ($1, $2, $3, $4)`,
+            [
+              run.id,
+              channel.type,
+              json({ url: channel.url, secret: channel.secret ?? null }),
+              json(channel.events ?? [])
+            ]
+          )
+        }
+        await appendEvent(client, run.id, 'run.enqueued', { queue, runAt: runAt.toISOString() })
+        return run
+      })
+      return c.json({ run: result, deduplicated: false })
+    } catch (error) {
+      if ((error as { code?: string }).code === '23505' && body.dedupeKey) {
+        const existing = await pool.query(
+          `select * from runs
+           where queue_name = $1 and dedupe_key = $2 and status in ('queued', 'running')
+           limit 1`,
+          [queue, body.dedupeKey]
+        )
+        if (existing.rows[0]) {
+          return c.json({ run: mapRun(existing.rows[0]), deduplicated: true })
+        }
+      }
+      throw error
+    }
+  })
+
+  // Pull-mode dispatch: claim ready queued runs with SKIP LOCKED, honoring
+  // per-queue concurrency caps and rate limits. A claim acquires the run
+  // lease directly, so worker death is handled by the existing lease-expiry
+  // machinery (the reconciler requeues or fails it).
+  app.post('/queues/claim', async (c) => {
+    const body = claimSchema.parse(await c.req.json())
+    const leaseOwner = body.leaseOwner ?? randomUUID()
+    const limit = body.limit ?? 1
+    const claimed: ReturnType<typeof mapRun>[] = []
+    await tx(async (client) => {
+      for (const queue of body.queues) {
+        if (claimed.length >= limit) break
+        // Serialize claims per queue so cap math can't race between claimers.
+        await client.query(`select pg_advisory_xact_lock(hashtext('queue:' || $1))`, [queue])
+        const configResult = await client.query('select * from queue_configs where name = $1', [queue])
+        const config = configResult.rows[0]
+        let capacity = limit - claimed.length
+        if (config?.concurrency != null) {
+          const running = await client.query(
+            `select count(*)::int as n from runs where queue_name = $1 and status = 'running'`,
+            [queue]
+          )
+          capacity = Math.min(capacity, Math.max(0, config.concurrency - running.rows[0].n))
+        }
+        if (config?.rate_per_minute != null) {
+          const recent = await client.query(
+            `select count(*)::int as n from runs
+             where queue_name = $1 and claimed_at > now() - interval '1 minute'`,
+            [queue]
+          )
+          capacity = Math.min(capacity, Math.max(0, config.rate_per_minute - recent.rows[0].n))
+        }
+        if (capacity <= 0) continue
+        const ready = await client.query(
+          `select id from runs
+           where queue_name = $1 and status = 'queued' and run_at <= now()
+           order by priority desc, run_at asc
+           limit $2
+           for update skip locked`,
+          [queue, capacity]
+        )
+        for (const row of ready.rows) {
+          const update = await client.query(
+            `update runs
+             set status = 'running',
+                 lease_owner = $2,
+                 lease_expires_at = now() + ($3 || ' milliseconds')::interval,
+                 attempt = attempt + 1,
+                 claimed_at = now(),
+                 updated_at = now()
+             where id = $1
+             returning *`,
+            [row.id, leaseOwner, leaseMs]
+          )
+          await appendEvent(client, row.id, 'run.claimed', { leaseOwner, queue })
+          claimed.push(mapRun(update.rows[0]))
+        }
+      }
+    })
+    return c.json({ runs: claimed, leaseOwner })
+  })
+
+  app.get('/queues', async (c) => {
+    const stats = await pool.query(
+      `select queue_name,
+              count(*) filter (where status = 'queued')::int as queued,
+              count(*) filter (where status = 'running')::int as running,
+              count(*) filter (where status = 'failed')::int as failed,
+              count(*) filter (where status = 'completed')::int as completed,
+              count(*) filter (where status = 'cancelled')::int as cancelled
+       from runs where queue_name is not null
+       group by queue_name`
+    )
+    const configs = await pool.query('select * from queue_configs')
+    const configByName = new Map(configs.rows.map((row) => [row.name, row]))
+    const queues = stats.rows.map((row) => ({
+      name: row.queue_name,
+      queued: row.queued,
+      running: row.running,
+      failed: row.failed,
+      completed: row.completed,
+      cancelled: row.cancelled,
+      config: mapQueueConfig(configByName.get(row.queue_name))
+    }))
+    for (const [name, config] of configByName) {
+      if (!queues.some((q) => q.name === name)) {
+        queues.push({
+          name,
+          queued: 0,
+          running: 0,
+          failed: 0,
+          completed: 0,
+          cancelled: 0,
+          config: mapQueueConfig(config)
+        })
+      }
+    }
+    return c.json({ queues })
+  })
+
+  app.put('/queues/:queue/config', async (c) => {
+    const queue = c.req.param('queue')
+    const body = queueConfigSchema.parse(await c.req.json())
+    const result = await pool.query(
+      `insert into queue_configs (name, concurrency, rate_per_minute, invoke_url)
+       values ($1, $2, $3, $4)
+       on conflict (name) do update set
+         concurrency = coalesce($2, queue_configs.concurrency),
+         rate_per_minute = coalesce($3, queue_configs.rate_per_minute),
+         invoke_url = coalesce($4, queue_configs.invoke_url),
+         updated_at = now()
+       returning *`,
+      [queue, body.concurrency ?? null, body.ratePerMinute ?? null, body.invokeUrl ?? null]
+    )
+    return c.json({ config: mapQueueConfig(result.rows[0]) })
+  })
+
+  // ---- schedules ----------------------------------------------------------
+  app.put('/schedules/:name', async (c) => {
+    const name = c.req.param('name')
+    const body = scheduleSchema.parse(await c.req.json())
+    parseCron(body.cron) // validate before persisting
+    const next = nextFire(body.cron, new Date())
+    const result = await pool.query(
+      `insert into schedules (name, cron, workflow_name, input_json, queue_name, max_attempts, enabled, next_run_at)
+       values ($1, $2, $3, $4, $5, $6, $7, $8)
+       on conflict (name) do update set
+         cron = $2, workflow_name = $3, input_json = $4, queue_name = $5,
+         max_attempts = $6, enabled = $7, next_run_at = $8, updated_at = now()
+       returning *`,
+      [
+        name,
+        body.cron,
+        body.workflowName,
+        json(body.input ?? {}),
+        body.queue ?? 'default',
+        body.maxAttempts ?? 1,
+        body.enabled ?? true,
+        next
+      ]
+    )
+    return c.json({ schedule: mapSchedule(result.rows[0]) })
+  })
+
+  app.get('/schedules', async (c) => {
+    const result = await pool.query('select * from schedules order by name asc')
+    return c.json({ schedules: result.rows.map(mapSchedule) })
+  })
+
+  app.delete('/schedules/:name', async (c) => {
+    const result = await pool.query('delete from schedules where name = $1 returning name', [
+      c.req.param('name')
+    ])
+    if (!result.rows[0]) return c.json({ error: 'schedule not found' }, 404)
+    return c.json({ deleted: result.rows[0].name })
   })
 
   app.get('/runs/:runId', async (c) => {
@@ -340,6 +682,7 @@ export function createApp() {
       const row = result.rows[0]
       if (!row) return null
       if (row.status === 'completed') return mapRun(row)
+      if (row.status === 'cancelled') return { cancelled: true, run: mapRun(row) }
       if (
         row.lease_owner &&
         row.lease_expires_at &&
@@ -363,6 +706,9 @@ export function createApp() {
       return mapRun(update.rows[0])
     })
     if (!run) return c.json({ error: 'run not found' }, 404)
+    if ('cancelled' in run) {
+      return c.json({ error: 'run is cancelled', code: 'run_cancelled', run: run.run }, 409)
+    }
     if ('locked' in run) return c.json({ error: 'run is leased', leaseOwner: run.leaseOwner }, 409)
     return c.json({ run, leaseOwner })
   })
@@ -371,6 +717,8 @@ export function createApp() {
     const runId = c.req.param('runId')
     const body = await c.req.json()
     const result = await tx(async (client) => {
+      // Cancellation is one-way: a worker finishing after cancel cannot
+      // resurrect the run.
       const update = await client.query(
         `update runs
          set status = 'completed',
@@ -380,11 +728,15 @@ export function createApp() {
              lease_expires_at = null,
              completed_at = now(),
              updated_at = now()
-         where id = $1
+         where id = $1 and status <> 'cancelled'
          returning *`,
         [runId, json(body.result ?? null)]
       )
-      if (!update.rows[0]) return null
+      if (!update.rows[0]) {
+        const existing = await client.query('select * from runs where id = $1', [runId])
+        if (!existing.rows[0]) return null
+        return { run: mapRun(existing.rows[0]), deliveries: [] as QueuedChannelDelivery[] }
+      }
       await appendEvent(client, runId, 'run.completed', {
         result: body.result ?? null
       })
@@ -402,35 +754,75 @@ export function createApp() {
     const runId = c.req.param('runId')
     const body = await c.req.json()
     const result = await tx(async (client) => {
+      const existing = await client.query('select * from runs where id = $1 for update', [runId])
+      const row = existing.rows[0]
+      if (!row) return null
+      if (row.status === 'cancelled') {
+        return { run: mapRun(row), deliveries: [] as QueuedChannelDelivery[], requeued: false, skipRecovery: true }
+      }
+      // Queue runs with attempts remaining go back to 'queued' with backoff
+      // instead of failing — retries are a lifecycle transition, not app glue.
+      if (row.queue_name && Number(row.attempt) < Number(row.max_attempts)) {
+        const backoff = retryBackoffMs(Number(row.attempt))
+        const update = await client.query(
+          `update runs
+           set status = 'queued',
+               error_json = $2,
+               lease_owner = null,
+               lease_expires_at = null,
+               run_at = now() + ($3 || ' milliseconds')::interval,
+               updated_at = now()
+           where id = $1
+           returning *`,
+          [runId, json(body.error ?? {}), backoff]
+        )
+        const run = mapRun(update.rows[0])
+        await appendEvent(client, runId, 'run.requeued', {
+          error: body.error ?? {},
+          attempt: run.attempt,
+          maxAttempts: run.maxAttempts,
+          nextRunAt: run.runAt
+        })
+        return { run, deliveries: [] as QueuedChannelDelivery[], requeued: true, skipRecovery: true }
+      }
+      const failureClass =
+        row.queue_name && Number(row.max_attempts) > 1 ? 'max_retries' : (body.failureClass ?? null)
       const update = await client.query(
         `update runs
          set status = 'failed',
              error_json = $2,
+             failure_class = $3,
              lease_owner = null,
              lease_expires_at = null,
              updated_at = now()
          where id = $1
          returning *`,
-        [runId, json(body.error ?? {})]
+        [runId, json(body.error ?? {}), failureClass]
       )
-      if (!update.rows[0]) return null
-      await appendEvent(client, runId, 'run.failed', { error: body.error ?? {} })
+      await appendEvent(client, runId, 'run.failed', {
+        error: body.error ?? {},
+        failureClass
+      })
       const deliveries = await queueChannelDeliveries(client, runId, 'run.failed', {
         run: mapRun(update.rows[0]),
         error: body.error ?? {}
       })
-      return { run: mapRun(update.rows[0]), deliveries }
+      return { run: mapRun(update.rows[0]), deliveries, requeued: false, skipRecovery: false }
     })
     if (!result) return c.json({ error: 'run not found' }, 404)
     await dispatchChannelDeliveries(result.deliveries)
-    await dispatchRecovery(result.run, 'run_failed')
-    return c.json({ run: result.run })
+    if (!result.skipRecovery) await dispatchRecovery(result.run, 'run_failed')
+    return c.json({ run: result.run, requeued: result.requeued })
   })
 
   app.post('/runs/:runId/gates/begin', async (c) => {
     const runId = c.req.param('runId')
     const body = gateBeginSchema.parse(await c.req.json())
     const result = await tx(async (client) => {
+      const runRow = await client.query('select status from runs where id = $1', [runId])
+      if (runRow.rows[0]?.status === 'cancelled') {
+        return { cancelled: true as const }
+      }
       // Same gap as steps/begin: concurrent first-begins would both insert and
       // one would abort on unique(run_id, name).
       await client.query(
@@ -472,17 +864,22 @@ export function createApp() {
       )
       return { gate, deliveries }
     })
+    if ('cancelled' in result) {
+      return c.json({ error: 'run is cancelled', code: 'run_cancelled' }, 409)
+    }
     await dispatchChannelDeliveries(result.deliveries)
     return c.json({ action: result.gate.status === 'pending' ? 'wait' : 'return', gate: result.gate })
   })
 
   app.get('/runs/:runId/gates/:gateId', async (c) => {
     const result = await pool.query(
-      'select * from gates where run_id = $1 and id = $2',
+      `select g.*, r.status as run_status
+       from gates g join runs r on r.id = g.run_id
+       where g.run_id = $1 and g.id = $2`,
       [c.req.param('runId'), c.req.param('gateId')]
     )
     if (!result.rows[0]) return c.json({ error: 'gate not found' }, 404)
-    return c.json({ gate: mapGate(result.rows[0]) })
+    return c.json({ gate: mapGate(result.rows[0]), runStatus: result.rows[0].run_status })
   })
 
   app.post('/runs/:runId/gates/:gateId/resolve', async (c) => {
@@ -548,6 +945,12 @@ export function createApp() {
     const leaseOwner = body.leaseOwner ?? randomUUID()
 
     const result = await tx(async (client) => {
+      // Cancellation is enforced at step boundaries: an in-flight worker
+      // discovers it here and unwinds instead of starting new work.
+      const runRow = await client.query('select status from runs where id = $1', [runId])
+      if (runRow.rows[0]?.status === 'cancelled') {
+        return { action: 'cancelled' }
+      }
       // `for update` cannot lock a row that does not exist yet, so concurrent
       // first-begins of the same step would race past the lease check below.
       await client.query(
@@ -942,10 +1345,16 @@ export function createApp() {
   return app
 }
 
-async function dispatchRecovery(run: ReturnType<typeof mapRun>, reason: string) {
-  if (!run.recoveryWebhook) return null
+export async function dispatchRecovery(
+  run: ReturnType<typeof mapRun>,
+  reason: string,
+  payloadType: 'run.resume' | 'run.invoke' = 'run.resume',
+  webhookUrl?: string
+) {
+  const url = webhookUrl ?? run.recoveryWebhook
+  if (!url) return null
   const payload = {
-    type: 'run.resume',
+    type: payloadType,
     runId: run.id,
     workflowName: run.workflowName,
     reason,
@@ -961,7 +1370,7 @@ async function dispatchRecovery(run: ReturnType<typeof mapRun>, reason: string) 
       `insert into recovery_attempts (run_id, reason, webhook_url, status)
        values ($1, $2, $3, 'pending')
        returning *`,
-      [run.id, reason, run.recoveryWebhook]
+      [run.id, reason, url]
     )
     await appendEvent(client, run.id, 'recovery.started', {
       recoveryAttemptId: result.rows[0].id,
@@ -971,11 +1380,11 @@ async function dispatchRecovery(run: ReturnType<typeof mapRun>, reason: string) 
   })
 
   try {
-    const response = await fetch(run.recoveryWebhook, {
+    const response = await fetch(url, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'user-agent': 'tidebase-recovery/0.3.0',
+        'user-agent': 'tidebase-recovery/0.5.0',
         ...(signature ? { 'x-tidebase-signature': `sha256=${signature}` } : {})
       },
       body
@@ -1084,7 +1493,7 @@ async function recordStateVersion(
   return mapStateVersion(versionResult.rows[0])
 }
 
-function mapRun(row: Record<string, any>) {
+export function mapRun(row: Record<string, any>) {
   return {
     id: row.id as string,
     workflowName: row.workflow_name as string,
@@ -1097,6 +1506,17 @@ function mapRun(row: Record<string, any>) {
     leaseOwner: row.lease_owner as string | null,
     leaseExpiresAt: row.lease_expires_at?.toISOString?.() ?? null,
     attempt: Number(row.attempt),
+    queue: (row.queue_name as string | null) ?? null,
+    dedupeKey: (row.dedupe_key as string | null) ?? null,
+    priority: row.priority != null ? Number(row.priority) : 0,
+    runAt: row.run_at?.toISOString?.() ?? null,
+    maxAttempts: row.max_attempts != null ? Number(row.max_attempts) : 1,
+    deadlineAt: row.deadline_at?.toISOString?.() ?? null,
+    cancelRequestedAt: row.cancel_requested_at?.toISOString?.() ?? null,
+    cancelledAt: row.cancelled_at?.toISOString?.() ?? null,
+    cancelReason: (row.cancel_reason as string | null) ?? null,
+    cancelActor: (row.cancel_actor as string | null) ?? null,
+    failureClass: (row.failure_class as string | null) ?? null,
     createdAt: row.created_at.toISOString(),
     updatedAt: row.updated_at.toISOString(),
     completedAt: row.completed_at?.toISOString?.() ?? null
@@ -1105,6 +1525,32 @@ function mapRun(row: Record<string, any>) {
 
 function json(value: unknown) {
   return JSON.stringify(value)
+}
+
+function mapQueueConfig(row: Record<string, any> | undefined) {
+  if (!row) return null
+  return {
+    name: row.name as string,
+    concurrency: row.concurrency != null ? Number(row.concurrency) : null,
+    ratePerMinute: row.rate_per_minute != null ? Number(row.rate_per_minute) : null,
+    invokeUrl: (row.invoke_url as string | null) ?? null
+  }
+}
+
+function mapSchedule(row: Record<string, any>) {
+  return {
+    name: row.name as string,
+    cron: row.cron as string,
+    workflowName: row.workflow_name as string,
+    input: row.input_json,
+    queue: row.queue_name as string,
+    maxAttempts: Number(row.max_attempts),
+    enabled: Boolean(row.enabled),
+    nextRunAt: row.next_run_at?.toISOString?.() ?? null,
+    lastEnqueuedAt: row.last_enqueued_at?.toISOString?.() ?? null,
+    createdAt: row.created_at.toISOString(),
+    updatedAt: row.updated_at.toISOString()
+  }
 }
 
 type QueuedChannelDelivery = {

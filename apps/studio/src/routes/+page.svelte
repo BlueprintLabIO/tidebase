@@ -16,12 +16,17 @@
     Server,
     ShieldAlert,
     Webhook,
-    XCircle
+    XCircle,
+    Layers
   } from '@lucide/svelte'
 
   const API = import.meta.env.VITE_TIDEBASE_API ?? 'http://localhost:7373'
+  const API_KEY = import.meta.env.VITE_TIDEBASE_API_KEY as string | undefined
+  const authHeaders: Record<string, string> = API_KEY
+    ? { authorization: `Bearer ${API_KEY}` }
+    : {}
 
-  type ConsoleView = 'runs' | 'checkpoints' | 'recovery' | 'postgres'
+  type ConsoleView = 'runs' | 'checkpoints' | 'queues' | 'recovery' | 'postgres'
   type RunTab = 'steps' | 'state' | 'usage' | 'recovery' | 'events'
   type RunStatus = 'created' | 'running' | 'completed' | 'failed' | string
 
@@ -125,6 +130,26 @@
     events: RunEvent[]
   }
 
+  type QueueStat = {
+    name: string
+    queued: number
+    running: number
+    failed: number
+    completed: number
+    cancelled: number
+    config: { concurrency: number | null; ratePerMinute: number | null; invokeUrl: string | null } | null
+  }
+
+  type Schedule = {
+    name: string
+    cron: string
+    workflowName: string
+    queue: string
+    enabled: boolean
+    nextRunAt: string | null
+    lastEnqueuedAt: string | null
+  }
+
   const viewMeta: Record<ConsoleView, { title: string; subtitle: string }> = {
     runs: {
       title: 'Runs',
@@ -133,6 +158,10 @@
     checkpoints: {
       title: 'Checkpoints',
       subtitle: 'Inspect replay boundaries, completed step outputs, and failed attempts.'
+    },
+    queues: {
+      title: 'Queues',
+      subtitle: 'Durable queues, schedules, and dispatch — depth, caps, and cron in one place.'
     },
     recovery: {
       title: 'Control',
@@ -157,6 +186,20 @@
     queryKey: ['runs'],
     queryFn: () => get<{ runs: Run[] }>('/runs'),
     refetchInterval: 2500
+  }))
+
+  const queuesQuery = createQuery<{ queues: QueueStat[] }>(() => ({
+    queryKey: ['queues'],
+    queryFn: () => get<{ queues: QueueStat[] }>('/queues'),
+    refetchInterval: 2500,
+    enabled: activeView === 'queues'
+  }))
+
+  const schedulesQuery = createQuery<{ schedules: Schedule[] }>(() => ({
+    queryKey: ['schedules'],
+    queryFn: () => get<{ schedules: Schedule[] }>('/schedules'),
+    refetchInterval: 5000,
+    enabled: activeView === 'queues'
   }))
 
   const detailQuery = createQuery<RunDetail | null>(() => ({
@@ -250,7 +293,9 @@
   function openStream(runId: string) {
     if (source?.url.endsWith(`/runs/${runId}/events`)) return
     closeStream()
-    source = new EventSource(`${API}/runs/${runId}/events`)
+    source = new EventSource(
+      `${API}/runs/${runId}/events${API_KEY ? `?token=${encodeURIComponent(API_KEY)}` : ''}`
+    )
     streamState = 'connected'
     source.onmessage = () => {
       void queryClient.invalidateQueries({ queryKey: ['runs'] })
@@ -271,6 +316,12 @@
     await navigator.clipboard?.writeText(text)
   }
 
+  async function cancelRun(runId: string) {
+    await post(`/runs/${runId}/cancel`, { reason: 'cancelled from Studio', actor: 'studio:local' })
+    await refreshRuns()
+    await queryClient.invalidateQueries({ queryKey: ['runs', runId] })
+  }
+
   async function resolveGate(gate: Gate, decision: 'approved' | 'rejected') {
     if (!selectedRunId) return
     await post(`/runs/${selectedRunId}/gates/${gate.id}/resolve`, {
@@ -283,7 +334,7 @@
   }
 
   async function get<T>(path: string): Promise<T> {
-    const response = await fetch(`${API}${path}`)
+    const response = await fetch(`${API}${path}`, { headers: authHeaders })
     if (!response.ok) throw new Error(await response.text())
     return (await response.json()) as T
   }
@@ -291,7 +342,7 @@
   async function post<T>(path: string, body: unknown): Promise<T> {
     const response = await fetch(`${API}${path}`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...authHeaders },
       body: JSON.stringify(body)
     })
     if (!response.ok) throw new Error(await response.text())
@@ -376,6 +427,9 @@
       </button>
       <button class:active={activeView === 'checkpoints'} class="nav-button" onclick={() => (activeView = 'checkpoints')}>
         <GitBranch size={17} /> <span>Checkpoints</span>
+      </button>
+      <button class:active={activeView === 'queues'} class="nav-button" onclick={() => (activeView = 'queues')}>
+        <Layers size={17} /> <span>Queues</span>
       </button>
       <button class:active={activeView === 'recovery'} class="nav-button" onclick={() => (activeView = 'recovery')}>
         <RotateCcw size={17} /> <span>Control</span>
@@ -510,11 +564,63 @@
             streamState,
             usageTotals,
             onTab: (tab) => (selectedTab = tab),
-            onCopy: (text) => void copy(text)
+            onCopy: (text) => void copy(text),
+            onCancel: (runId) => void cancelRun(runId)
           })}
         </section>
       {:else if activeView === 'checkpoints'}
         {@render CheckpointsView(detail)}
+      {:else if activeView === 'queues'}
+        <section class="card">
+          <h3 style="margin: 0 0 4px;">Queues</h3>
+          <p class="meta" style="margin: 0 0 12px;">A queued job is a run — depth here is lifecycle truth, not a shadow table.</p>
+          <table class="table">
+            <thead>
+              <tr><th>Queue</th><th>Queued</th><th>Running</th><th>Completed</th><th>Failed</th><th>Cancelled</th><th>Concurrency</th><th>Rate/min</th><th>Dispatch</th></tr>
+            </thead>
+            <tbody>
+              {#each queuesQuery.data?.queues ?? [] as q (q.name)}
+                <tr>
+                  <td class="mono">{q.name}</td>
+                  <td>{q.queued}</td>
+                  <td>{q.running}</td>
+                  <td>{q.completed}</td>
+                  <td>{q.failed}</td>
+                  <td>{q.cancelled}</td>
+                  <td>{q.config?.concurrency ?? '∞'}</td>
+                  <td>{q.config?.ratePerMinute ?? '—'}</td>
+                  <td class="mono">{q.config?.invokeUrl ? 'push' : 'pull'}</td>
+                </tr>
+              {:else}
+                <tr><td colspan="9" class="meta">No queued runs yet. Enqueue with tide.enqueue(...) or POST /queues/:queue/enqueue.</td></tr>
+              {/each}
+            </tbody>
+          </table>
+        </section>
+        <section class="card" style="margin-top: 16px;">
+          <h3 style="margin: 0 0 4px;">Schedules</h3>
+          <p class="meta" style="margin: 0 0 12px;">Cron-driven enqueues. Fire-time dedupe keys make double-fires structurally impossible.</p>
+          <table class="table">
+            <thead>
+              <tr><th>Name</th><th>Cron</th><th>Workflow</th><th>Queue</th><th>Next run</th><th>Last enqueued</th><th>Enabled</th></tr>
+            </thead>
+            <tbody>
+              {#each schedulesQuery.data?.schedules ?? [] as sched (sched.name)}
+                <tr>
+                  <td class="mono">{sched.name}</td>
+                  <td class="mono">{sched.cron}</td>
+                  <td class="mono">{sched.workflowName}</td>
+                  <td class="mono">{sched.queue}</td>
+                  <td>{formatTime(sched.nextRunAt)}</td>
+                  <td>{formatTime(sched.lastEnqueuedAt)}</td>
+                  <td>{sched.enabled ? 'yes' : 'no'}</td>
+                </tr>
+              {:else}
+                <tr><td colspan="7" class="meta">No schedules. Create one with tide.schedules.set(...) or PUT /schedules/:name.</td></tr>
+              {/each}
+            </tbody>
+          </table>
+        </section>
       {:else if activeView === 'recovery'}
         {@render RecoveryView(detail, (gate, decision) => void resolveGate(gate, decision))}
       {:else}
@@ -575,6 +681,7 @@
   usageTotals: { inputTokens: number; outputTokens: number; totalTokens: number; costUsd: number }
   onTab: (tab: RunTab) => void
   onCopy: (text: string) => void
+  onCancel: (runId: string) => void
 })}
   <section class="panel">
     {#if !props.selectedRun}
@@ -592,6 +699,11 @@
             <button class="button" onclick={() => props.onCopy(props.selectedRun?.id ?? '')}>
               <Copy size={15} /> Copy id
             </button>
+            {#if ['pending', 'queued', 'running'].includes(props.selectedRun.status)}
+              <button class="button" onclick={() => props.onCancel(props.selectedRun?.id ?? '')}>
+                <XCircle size={15} /> Cancel run
+              </button>
+            {/if}
           </div>
         </div>
         <div class="facts">

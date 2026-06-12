@@ -5,14 +5,14 @@
 <h1 align="center">Tidebase</h1>
 
 <p align="center">
-  Checkpointed runs, live state, gates, and usage tracking for existing agent workflows.
+  Checkpoints, queues, schedules, gates, live state, and cancellation for agent workflows — in your own Postgres.
 </p>
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-0aabc0.svg" alt="License: Apache-2.0"></a>
   <a href="https://github.com/BlueprintLabIO/tidebase/releases"><img src="https://img.shields.io/github/v/release/BlueprintLabIO/tidebase?color=0aabc0" alt="Latest release"></a>
   <a href="https://github.com/BlueprintLabIO/tidebase/actions/workflows/ci.yml"><img src="https://github.com/BlueprintLabIO/tidebase/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/SDK-TypeScript-0e6f80.svg" alt="TypeScript SDK">
+  <img src="https://img.shields.io/badge/SDK-TypeScript%20%C2%B7%20Python-0e6f80.svg" alt="TypeScript and Python SDKs">
   <img src="https://img.shields.io/badge/storage-Postgres-0e6f80.svg" alt="Postgres storage">
 </p>
 
@@ -28,9 +28,11 @@
 
 ![Tidebase Studio](docs/assets/dashboard-shot.png)
 
-Tidebase is a self-hosted run backend for long-running agent workflows.
+Tidebase is an open-source checkpoint layer for AI agents: wrap your steps, and failed runs resume from the last safe point — in your own Postgres, without moving execution into a new runtime.
 
-Your code still runs in your app, worker, or job process. Tidebase stores checkpoints, state, events, gates, channel deliveries, recovery attempts, and usage records in Postgres so failed runs can resume from the last safe point without moving execution into a hosted runtime.
+Your code still runs in your app, worker, or job process. Tidebase stores checkpoints, state, events, gates, channel deliveries, recovery attempts, and usage records in Postgres, so "this run died at step 7 — is it safe to rerun?" always has an answer.
+
+Docs: <https://tidebase.dev> · Community: [Discord](https://discord.gg/JQ5sutdP8Y) · For AI assistants: [/llms.txt](https://tidebase.dev/llms.txt)
 
 ## Why Tidebase
 
@@ -93,13 +95,69 @@ The `plan` and `fetch-sources` steps are returned from checkpoints. Only `write-
   <img src="docs/assets/crash-resume.gif" width="820" alt="Kill the process mid-run, re-invoke with the same run id, and the workflow resumes from the last checkpoint">
 </p>
 
+## Using Tidebase with AI coding agents
+
+Make every AI session in your project use Tidebase correctly:
+
+```bash
+npx tidebase init        # writes a Tidebase section into AGENTS.md/CLAUDE.md (idempotent)
+```
+
+Give your assistant direct access to runs, gates, and recovery via MCP:
+
+```bash
+claude mcp add tidebase -e TIDEBASE_URL=http://localhost:7373 -- npx -y @tidebase/mcp
+```
+
+Or install the Claude Code plugin (skill + MCP server in one):
+
+```
+/plugin marketplace add BlueprintLabIO/tidebase
+/plugin install tidebase@tidebase
+```
+
+Agent-readable docs live at [tidebase.dev/llms.txt](https://tidebase.dev/llms.txt); every docs page also serves a raw `.md` twin.
+
+## Queues, schedules, and cancellation (v0.5)
+
+Tidebase can now decide **when** your code runs — while still never executing it:
+
+```typescript
+// durable queue: dedupe, delay, retries with backoff, concurrency caps
+await tide.enqueue('generate-report', {
+  queue: 'reports',
+  input: { topic },
+  dedupeKey: `report:${topic}`,
+  maxAttempts: 3,
+  deadlineMs: 600_000
+})
+
+// pull-mode worker: claims ready runs and executes registered workflows
+tide.workflow('generate-report', generateReport)
+await tide.work({ queues: ['reports'] })
+
+// cron (UTC, 5-field) — double-fires are structurally impossible
+await tide.schedules.set('daily-digest', {
+  cron: '0 9 * * *',
+  workflowName: 'daily-digest'
+})
+
+// authoritative, one-way cancellation — workers observe it at step/gate
+// boundaries; complete/fail can never resurrect a cancelled run
+await tide.runs.cancel(runId, { reason: 'customer asked', actor: 'support' })
+```
+
+Push-mode dispatch is also available: configure a queue with an `invokeUrl` and Tidebase delivers signed `run.invoke` webhooks to your app instead of waiting for a claim. A queued job IS a run — `queued` is a lifecycle state, not a second table — so status never drifts.
+
+See [docs/production.md](docs/production.md) for the full lifecycle, replay contract, worker-death recovery model, and deploy discipline (versioned migrations via `pnpm migrate`, `TIDEBASE_AUTO_MIGRATE=0` for expand/contract deploys).
+
 ## Testing
 
 ```bash
 pnpm test
 ```
 
-The suite (57 tests, run in CI on every push) uses the same Postgres in an isolated `tidebase_test` database. It is invariant-driven rather than coverage-driven: every test asserts a durability or safety guarantee through the public API or SDK, against real Postgres, including concurrency probes for the guarantees that only matter under contention.
+The suite (84 TypeScript tests + 9 Python integration tests, run in CI on every push) uses the same Postgres in an isolated `tidebase_test` database. It is invariant-driven rather than coverage-driven: every test asserts a durability or safety guarantee through the public API or SDK, against real Postgres, including concurrency probes for the guarantees that only matter under contention.
 
 What it proves:
 
@@ -365,7 +423,14 @@ Everything is backed by Postgres and designed for self-hosting from day one.
 ## Current Scope
 
 - Postgres-backed run store
+- authoritative run lifecycle with first-class cancellation and deadlines
+- durable queues (dedupe, delay, priority, retries/backoff, concurrency and rate caps)
+- cron schedules (UTC, double-fire-proof)
+- pull-mode workers (`tide.work`) and push-mode signed invocation webhooks
+- reconciler (lease-expiry requeue/recovery, deadline cancels, cron, dispatch)
+- versioned migration runner
 - TypeScript SDK
+- Python SDK incl. asyncio (`sdk-python/`, `tidebase.aio`)
 - SvelteKit Studio
 - live state set/patch
 - state history and labeled snapshots
@@ -379,13 +444,12 @@ Everything is backed by Postgres and designed for self-hosting from day one.
 
 ## Not In This Alpha
 
-- Tidebase-hosted code execution
-- queues or worker deployment
+- Tidebase-hosted code execution (your runtime stays yours)
 - LLM gateway/proxying
 - hosted channel adapters
 - secret custody or credential brokering
 - memory
-- auth
+- multi-tenant auth (single shared API key today)
 - hosted cloud
 
 ## Alpha Notes
@@ -394,7 +458,7 @@ This is ready for local demos and early feedback, not production.
 
 Important limits:
 
-- The server currently auto-runs the SQL schema on boot; a real migration runner is planned.
-- There is no API authentication yet. Run it only in trusted local/self-hosted environments.
+- Migrations are versioned and advisory-locked; dev auto-migrates on boot, and `TIDEBASE_AUTO_MIGRATE=0` + `pnpm migrate` gives expand/contract deploy discipline.
+- API auth is opt-in: set `TIDEBASE_API_KEY` on the server and the SDK (Studio: `VITE_TIDEBASE_API_KEY`). Without it the API is open — use only in trusted local/self-hosted environments.
 - External side effects still need idempotency keys in user code.
 - Tidebase remembers what happened and can call recovery webhooks, but it does not guarantee that user code will be available to resume.

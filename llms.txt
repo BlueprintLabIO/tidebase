@@ -1,0 +1,34 @@
+# Tidebase
+
+> Tidebase is an open-source checkpoint layer for AI agents: wrap your steps, and failed runs resume from the last safe point — in your own Postgres, without moving execution into a new runtime. It does not execute your code: your app still calls your LLMs, tools, and APIs directly, while a Postgres-backed server stores checkpoints, live state, events, approval gates, and usage records around it.
+
+Key facts: TypeScript SDK (`@tidebase/sdk`, Python planned), self-hosted (Docker + Postgres), Apache-2.0, server on :7373, Studio dashboard on :5173. Guarantee: completed steps never repeat on re-invocation with the same runId — not automatic process restart; something (queue, cron, retry button, or a signed recovery webhook) must re-invoke the workflow. Alpha: no API authentication yet; not production-ready. Repo: https://github.com/BlueprintLabIO/tidebase
+
+## Docs
+
+- [Quickstart](https://tidebase.dev/docs/quickstart.md): clone-to-resumed-run in ~2 minutes; every command non-interactive and agent-executable
+- [FAQ](https://tidebase.dev/docs/faq.md): is it safe to rerun, do I need Temporal, can two workers grab one run, where data lives, production readiness
+- [How to resume a failed AI agent run](https://tidebase.dev/docs/how-to-resume-a-failed-ai-agent-run.md): replay semantics, leases, recovery webhooks
+- [How to checkpoint AI agent workflows in Postgres](https://tidebase.dev/docs/checkpoint-ai-agent-workflows-postgres.md): run.step() usage, what gets stored, step granularity
+- [The replay contract — is it safe to rerun?](https://tidebase.dev/docs/replay-contract-is-it-safe-to-rerun.md): side effects, idempotency keys, failure classification (failed_retryable / manual_review / failed)
+- [Human approval gates for AI agents](https://tidebase.dev/docs/human-approval-gates-for-ai-agents.md): durable, exactly-once gates with webhook channels and resolve tokens
+- [Fork, time travel, and snapshot agent runs](https://tidebase.dev/docs/fork-and-time-travel-agent-runs.md): versioned state streams; snapshot = labeled version
+- [Fan out to subagents with child runs](https://tidebase.dev/docs/fanout-subagents-child-runs.md): run.fanout(), idempotent child creation by edge name, durable joins
+- [Track LLM token usage and cost per run](https://tidebase.dev/docs/track-llm-token-costs-per-run.md): run.usage.record() without an LLM proxy
+
+## Comparisons
+
+- [Tidebase vs Temporal](https://tidebase.dev/docs/compare/tidebase-vs-temporal.md): Temporal moves execution into its worker model; Tidebase wraps functions you already have
+- [Tidebase vs Inngest](https://tidebase.dev/docs/compare/tidebase-vs-inngest.md): platform-owned invocation vs external checkpoint record
+- [Tidebase vs LangGraph checkpointers](https://tidebase.dev/docs/compare/tidebase-vs-langgraph-checkpointer.md): framework persistence vs framework-agnostic layer
+- [Tidebase vs DBOS and Restate](https://tidebase.dev/docs/compare/tidebase-vs-dbos-restate.md): embedded durable execution vs external coordination
+
+## For AI assistants
+
+- [MCP server](https://github.com/BlueprintLabIO/tidebase-internal/tree/main/mcp-server/README.md): @tidebase/mcp — list runs, inspect run detail, read events and state versions, resolve gates, trigger recovery
+- [Agent Skill](https://github.com/BlueprintLabIO/tidebase-internal/tree/main/skills/tidebase/SKILL.md): when and how a coding agent should reach for Tidebase
+- [AGENTS.md snippet](https://github.com/BlueprintLabIO/tidebase-internal/tree/main/templates/agents-md-snippet.md): the block `tidebase init` writes into a project so future agent sessions use Tidebase correctly
+
+## Optional
+
+- [llms-full.txt](https://tidebase.dev/llms-full.txt): all documentation concatenated in one file

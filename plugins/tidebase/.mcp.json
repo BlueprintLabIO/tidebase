@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "tidebase": {
+      "command": "npx",
+      "args": ["-y", "@tidebase/mcp"],
+      "env": {
+        "TIDEBASE_URL": "${TIDEBASE_URL:-http://localhost:7373}"
+      }
+    }
+  }
+}
