@@ -713,6 +713,36 @@ export function createApp(options: CreateAppOptions = {}) {
     return c.json({ run, leaseOwner })
   })
 
+  app.post('/runs/:runId/heartbeat', async (c) => {
+    const runId = c.req.param('runId')
+    const body = await c.req.json()
+    const leaseOwner = body.leaseOwner
+    if (!leaseOwner) return c.json({ error: 'leaseOwner is required' }, 400)
+    // Extend-only renewal: no attempt bump, no run.started event. A worker
+    // that lost its lease (reconciler reclaim, takeover, cancellation) must
+    // not be able to resurrect it here — it learns it is a zombie instead.
+    const result = await tx(async (client) => {
+      const update = await client.query(
+        `update runs
+         set lease_expires_at = now() + ($3 || ' milliseconds')::interval,
+             updated_at = now()
+         where id = $1 and status = 'running' and lease_owner = $2
+         returning *`,
+        [runId, leaseOwner, leaseMs]
+      )
+      if (update.rows[0]) return { run: mapRun(update.rows[0]) }
+      const existing = await client.query('select * from runs where id = $1', [runId])
+      if (!existing.rows[0]) return null
+      return { lost: true, run: mapRun(existing.rows[0]) }
+    })
+    if (!result) return c.json({ error: 'run not found' }, 404)
+    if ('lost' in result) {
+      const code = result.run.status === 'cancelled' ? 'run_cancelled' : 'lease_lost'
+      return c.json({ error: 'lease lost', code, run: result.run }, 409)
+    }
+    return c.json(result)
+  })
+
   app.post('/runs/:runId/complete', async (c) => {
     const runId = c.req.param('runId')
     const body = await c.req.json()

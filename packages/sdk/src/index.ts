@@ -181,6 +181,26 @@ export type GateDecision = {
   payload: unknown
 }
 
+export type GateBeginOptions = Omit<GateOptions, 'pollMs'>
+
+export type GateStatus = {
+  gateId: string
+  name: string
+  status: string
+  decision: 'approved' | 'rejected' | 'canceled' | null
+  actor: string | null
+  payload: unknown
+}
+
+export type AttachOptions = RunOptions & {
+  /** Background lease renewal interval. Pass false to manage the lease yourself. */
+  heartbeatMs?: number | false
+  /** Called once if the lease cannot be renewed (reclaimed by the reconciler,
+   * taken over by another worker, or the run was cancelled). After this fires
+   * the session is a zombie: its writes will be fenced by the server. */
+  onLeaseLost?: (error: Error) => void
+}
+
 export type UsageRecordOptions = {
   stepId?: string
   kind?: string
@@ -507,6 +527,38 @@ export class RunsClient {
     }>(`/runs/${runId}`)
   }
 
+  /** Attach to a run as a session: acquire its lease and return a handle whose
+   * step/gate/state calls stay valid until complete()/fail(). Use this when
+   * execution is not function-shaped — a protocol gateway, a REPL, a run that
+   * spans many requests. Mirrors tide.run() semantics: omit runId to create,
+   * pass one to resume an existing run. */
+  async attach(workflowName: string, options: AttachOptions = {}): Promise<RunSession> {
+    const run =
+      options.runId == null
+        ? await this.create(workflowName, {
+            input: options.input,
+            metadata: options.metadata,
+            recoveryWebhook: options.recoveryWebhook,
+            channels: options.channels
+          })
+        : await this.get(options.runId).then((detail) => detail.run)
+
+    if (run.workflowName !== workflowName) {
+      throw new Error(
+        `Run ${run.id} belongs to workflow ${run.workflowName}, not ${workflowName}`
+      )
+    }
+    if (run.status === 'completed') {
+      throw new Error(`Run ${run.id} is already completed`)
+    }
+
+    const begin = await this.client.request<{ run: TideRun; leaseOwner: string }>(
+      `/runs/${run.id}/begin`,
+      { method: 'POST' }
+    )
+    return new RunSession(this.client, begin.run, begin.leaseOwner, options)
+  }
+
   async recover(runId: string, reason = 'manual') {
     return this.client.request<{ recoveryAttempt: unknown }>(`/runs/${runId}/recover`, {
       method: 'POST',
@@ -612,15 +664,17 @@ export class RunContext {
   readonly state: RunState
   readonly usage: RunUsage
   readonly snapshots: RunSnapshots
+  readonly gates: RunGates
 
   constructor(
-    private readonly client: Tidebase,
+    protected readonly client: Tidebase,
     readonly runId: string,
-    private readonly leaseOwner: string
+    protected readonly leaseOwner: string
   ) {
     this.state = new RunState(client, runId)
     this.usage = new RunUsage(client, runId)
     this.snapshots = new RunSnapshots(client, runId)
+    this.gates = new RunGates(client, runId)
   }
 
   async step<TResult>(
@@ -726,55 +780,25 @@ export class RunContext {
     throw new Error(`Step ${name} failed`)
   }
 
+  /** Open a gate and block until it resolves. Convenience over gates.begin()
+   * + gates.get(); use those directly when you cannot block on a human. */
   async gate(name: string, options: GateOptions): Promise<GateDecision> {
-    const begin = await this.client.request<{
-      action: 'wait' | 'return'
-      gate: {
-        id: string
-        name: string
-        status: string
-        decision: 'approved' | 'rejected' | 'canceled' | null
-        actor: string | null
-        decisionPayload: unknown
-      }
-    }>(`/runs/${this.runId}/gates/begin`, {
-      method: 'POST',
-      body: JSON.stringify({
-        name,
-        prompt: options.prompt,
-        data: options.data ?? {},
-        channels: options.channels ?? [],
-        capability: options.capability ?? null,
-        timeoutMs: options.timeoutMs
-      })
-    })
+    let gate = await this.gates.begin(name, options)
 
     const deadline = options.timeoutMs ? Date.now() + options.timeoutMs : null
-    let gate = begin.gate
     while (gate.status === 'pending') {
       if (deadline && Date.now() > deadline) {
         throw new Error(`Gate ${name} timed out`)
       }
       await sleep(options.pollMs ?? 1000)
-      const response = await this.client.request<{ gate: typeof gate; runStatus?: string }>(
-        `/runs/${this.runId}/gates/${gate.id}`
-      )
-      if (response.runStatus === 'cancelled') throw new RunCancelledError(this.runId)
-      gate = response.gate
+      gate = await this.gates.get(gate.gateId)
     }
 
     if (gate.decision !== 'approved' && gate.decision !== 'rejected' && gate.decision !== 'canceled') {
       throw new Error(`Gate ${name} resolved with unsupported decision ${gate.decision}`)
     }
 
-    return {
-      gateId: gate.id,
-      name: gate.name,
-      status: gate.status,
-      decision: gate.decision,
-      actor: gate.actor,
-      payload: gate.decisionPayload
-    }
+    return { ...gate, decision: gate.decision }
   }
 
   async child<TInput = unknown, TResult = unknown>(
@@ -867,6 +891,128 @@ function classifyResumeDecision(options: StepOptions) {
     return 'manual_review'
   }
   return 'safe_replay'
+}
+
+/** A run handle for session-shaped work: open-ended execution that is not a
+ * single workflow function (protocol gateways, REPLs, runs that span many
+ * requests). Holds the run lease via a background heartbeat and reports the
+ * terminal state explicitly through complete()/fail(). If the process dies,
+ * the heartbeat stops, the lease expires, and the reconciler takes over —
+ * exactly as if a workflow worker had crashed. */
+export class RunSession extends RunContext {
+  private heartbeatTimer?: ReturnType<typeof setInterval>
+
+  constructor(
+    client: Tidebase,
+    readonly run: TideRun,
+    leaseOwner: string,
+    options: Pick<AttachOptions, 'heartbeatMs' | 'onLeaseLost'> = {}
+  ) {
+    super(client, run.id, leaseOwner)
+    const heartbeatMs = options.heartbeatMs ?? 20_000
+    if (heartbeatMs !== false) {
+      this.heartbeatTimer = setInterval(() => {
+        this.heartbeat().catch((error) => {
+          this.stopHeartbeat()
+          options.onLeaseLost?.(error instanceof Error ? error : new Error(String(error)))
+        })
+      }, heartbeatMs)
+      // Renewal must not keep an otherwise-finished process alive.
+      ;(this.heartbeatTimer as { unref?: () => void }).unref?.()
+    }
+  }
+
+  /** Renew the run lease once. Throws if the lease was lost — the session is
+   * then a zombie and the server will fence its writes. */
+  async heartbeat() {
+    await this.client.request(`/runs/${this.runId}/heartbeat`, {
+      method: 'POST',
+      body: JSON.stringify({ leaseOwner: this.leaseOwner })
+    })
+  }
+
+  async complete<TResult>(result: TResult) {
+    this.stopHeartbeat()
+    await this.client.request(`/runs/${this.runId}/complete`, {
+      method: 'POST',
+      body: JSON.stringify({ result })
+    })
+  }
+
+  async fail(error: unknown) {
+    this.stopHeartbeat()
+    await this.client.request(`/runs/${this.runId}/fail`, {
+      method: 'POST',
+      body: JSON.stringify({ error: serializeError(error) })
+    })
+  }
+
+  /** Stop heartbeating without reporting a terminal state. The lease expires
+   * on its own and the reconciler reclaims the run (recovery webhook fires). */
+  close() {
+    this.stopHeartbeat()
+  }
+
+  private stopHeartbeat() {
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
+    this.heartbeatTimer = undefined
+  }
+}
+
+type GateRow = {
+  id: string
+  name: string
+  status: string
+  decision: 'approved' | 'rejected' | 'canceled' | null
+  actor: string | null
+  decisionPayload: unknown
+}
+
+export class RunGates {
+  constructor(
+    private readonly client: Tidebase,
+    private readonly runId: string
+  ) {}
+
+  /** Open (or rejoin) a gate without blocking on its resolution. Idempotent
+   * per gate name within a run: re-beginning a resolved gate returns its
+   * decision immediately, so retried callers converge on one answer. */
+  async begin(name: string, options: GateBeginOptions): Promise<GateStatus> {
+    const response = await this.client.request<{ action: 'wait' | 'return'; gate: GateRow }>(
+      `/runs/${this.runId}/gates/begin`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          name,
+          prompt: options.prompt,
+          data: options.data ?? {},
+          channels: options.channels ?? [],
+          capability: options.capability ?? null,
+          timeoutMs: options.timeoutMs
+        })
+      }
+    )
+    return mapGate(response.gate)
+  }
+
+  async get(gateId: string): Promise<GateStatus> {
+    const response = await this.client.request<{ gate: GateRow; runStatus?: string }>(
+      `/runs/${this.runId}/gates/${gateId}`
+    )
+    if (response.runStatus === 'cancelled') throw new RunCancelledError(this.runId)
+    return mapGate(response.gate)
+  }
+}
+
+function mapGate(gate: GateRow): GateStatus {
+  return {
+    gateId: gate.id,
+    name: gate.name,
+    status: gate.status,
+    decision: gate.decision,
+    actor: gate.actor,
+    payload: gate.decisionPayload
+  }
 }
 
 export class RunUsage {

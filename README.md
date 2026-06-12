@@ -192,6 +192,21 @@ await tide.run('generate-report', { runId }, async (run, input) => {
 })
 ```
 
+## Session Runs
+
+`tide.run()` fits work shaped like a function. For open-ended execution — a protocol gateway in front of an agent, a REPL, a run that spans many requests — attach to a run as a session instead:
+
+```typescript
+const session = await tide.runs.attach('mcp-session', { input: { agent: 'hermes' } })
+
+// session is a RunContext: step/gate/state/usage/snapshots all work unchanged
+await session.step('tool-call', { input: args }, () => callTool(args))
+
+await session.complete({ calls: 12 }) // or session.fail(err)
+```
+
+The session holds the run lease with a background heartbeat (`heartbeatMs`, default 20s). If the process dies, the heartbeat stops, the lease expires, and the reconciler takes over — requeue or recovery webhook, exactly as if a workflow worker had crashed. A session that loses its lease (`onLeaseLost`) is a zombie: the server fences its writes. Pass `runId` to resume an existing session's run; completed steps replay from storage.
+
 ## Resume Contracts
 
 Each step can declare the operational contract Tidebase should record for replay:
@@ -333,6 +348,17 @@ if (decision.decision !== 'approved') {
 ```
 
 Webhook gate payloads include a `resolveUrl` and `resolveToken`. Credential and capability fields are audit metadata only; Tidebase does not store or broker API keys in this alpha.
+
+When you cannot block on a human — an HTTP handler, a bot, a protocol gateway — use the non-blocking split that `run.gate()` is built on:
+
+```typescript
+const gate = await run.gates.begin('approve-send', { prompt: 'Send it?', data: { reportId } })
+if (gate.status === 'pending') {
+  // return now; check back with run.gates.get(gate.gateId) on a later request
+}
+```
+
+Gate begin is idempotent per name within a run: re-beginning a resolved gate returns its decision immediately, so retried callers converge on one answer.
 
 <p align="center">
   <img src="docs/assets/gates.gif" width="820" alt="A run pauses at a durable gate, a human approves the capability, and the workflow continues — fully audited">
