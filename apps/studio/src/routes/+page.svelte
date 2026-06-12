@@ -20,6 +20,10 @@
   } from '@lucide/svelte'
 
   const API = import.meta.env.VITE_TIDEBASE_API ?? 'http://localhost:7373'
+  const API_KEY = import.meta.env.VITE_TIDEBASE_API_KEY as string | undefined
+  const authHeaders: Record<string, string> = API_KEY
+    ? { authorization: `Bearer ${API_KEY}` }
+    : {}
 
   type ConsoleView = 'runs' | 'checkpoints' | 'recovery' | 'postgres'
   type RunTab = 'steps' | 'state' | 'usage' | 'recovery' | 'events'
@@ -250,7 +254,9 @@
   function openStream(runId: string) {
     if (source?.url.endsWith(`/runs/${runId}/events`)) return
     closeStream()
-    source = new EventSource(`${API}/runs/${runId}/events`)
+    source = new EventSource(
+      `${API}/runs/${runId}/events${API_KEY ? `?token=${encodeURIComponent(API_KEY)}` : ''}`
+    )
     streamState = 'connected'
     source.onmessage = () => {
       void queryClient.invalidateQueries({ queryKey: ['runs'] })
@@ -283,7 +289,7 @@
   }
 
   async function get<T>(path: string): Promise<T> {
-    const response = await fetch(`${API}${path}`)
+    const response = await fetch(`${API}${path}`, { headers: authHeaders })
     if (!response.ok) throw new Error(await response.text())
     return (await response.json()) as T
   }
@@ -291,7 +297,7 @@
   async function post<T>(path: string, body: unknown): Promise<T> {
     const response = await fetch(`${API}${path}`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...authHeaders },
       body: JSON.stringify(body)
     })
     if (!response.ok) throw new Error(await response.text())

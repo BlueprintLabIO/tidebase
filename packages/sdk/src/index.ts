@@ -311,7 +311,11 @@ export class Tidebase {
   }
 
   eventSource(path: string) {
-    return `${this.url}${path}`
+    // EventSource cannot set headers, so the server accepts the API key as a
+    // query token on the SSE endpoint when auth is enabled.
+    if (!this.apiKey) return `${this.url}${path}`
+    const joiner = path.includes('?') ? '&' : '?'
+    return `${this.url}${path}${joiner}token=${encodeURIComponent(this.apiKey)}`
   }
 }
 

@@ -1,0 +1,20 @@
+{
+  "name": "tidebase",
+  "owner": {
+    "name": "BlueprintLab",
+    "url": "https://github.com/BlueprintLabIO"
+  },
+  "metadata": {
+    "description": "Tidebase — the open-source checkpoint layer for AI agents. Checkpoints, replay, gates, and live state in your own Postgres.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "tidebase",
+      "source": "./plugins/tidebase",
+      "description": "Build crash-safe agent workflows with Tidebase: a skill that teaches the agent when and how to use checkpoints, gates, fanout, and resume contracts, plus an MCP server to inspect runs and resolve gates from your assistant.",
+      "category": "development",
+      "keywords": ["ai-agents", "checkpoint", "durable", "postgres", "workflow", "human-in-the-loop"]
+    }
+  ]
+}

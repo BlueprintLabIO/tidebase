@@ -39,6 +39,7 @@ The SDK unit tests (`packages/sdk/test`) need no infrastructure.
 | Recovery webhooks are HMAC-signed; the SDK handler rejects unsigned, tampered, and forged payloads | Security of the recovery path | `packages/sdk/test/webhook.test.ts` |
 | Channel deliveries are signed, filtered by event list, recorded win-or-lose, and dispatched after commit — a slow endpoint never blocks other writers to the run | Channels must observe runs without being able to stall them | `channels.test.ts` |
 | The SDK's resume classification matches the server's: plain/read-only → `safe_replay`, unkeyed writes → `manual_review`, keyed writes → `safe_replay` | Both sides of the wire must agree on the safety contract | `e2e-recovery.test.ts` |
+| With `TIDEBASE_API_KEY` set, every surface except `/health` rejects missing/wrong/malformed credentials (timing-safe compare); `?token=` is honored on the SSE endpoint only; with no key configured the API stays open | Auth must fail closed without breaking probes, EventSource, or trusted local setups | `auth.test.ts` |
 
 ## Conventions
 

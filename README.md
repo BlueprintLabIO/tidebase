@@ -12,7 +12,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-0aabc0.svg" alt="License: Apache-2.0"></a>
   <a href="https://github.com/BlueprintLabIO/tidebase/releases"><img src="https://img.shields.io/github/v/release/BlueprintLabIO/tidebase?color=0aabc0" alt="Latest release"></a>
   <a href="https://github.com/BlueprintLabIO/tidebase/actions/workflows/ci.yml"><img src="https://github.com/BlueprintLabIO/tidebase/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/SDK-TypeScript-0e6f80.svg" alt="TypeScript SDK">
+  <img src="https://img.shields.io/badge/SDK-TypeScript%20%C2%B7%20Python-0e6f80.svg" alt="TypeScript and Python SDKs">
   <img src="https://img.shields.io/badge/storage-Postgres-0e6f80.svg" alt="Postgres storage">
 </p>
 
@@ -28,9 +28,11 @@
 
 ![Tidebase Studio](docs/assets/dashboard-shot.png)
 
-Tidebase is a self-hosted run backend for long-running agent workflows.
+Tidebase is an open-source checkpoint layer for AI agents: wrap your steps, and failed runs resume from the last safe point — in your own Postgres, without moving execution into a new runtime.
 
-Your code still runs in your app, worker, or job process. Tidebase stores checkpoints, state, events, gates, channel deliveries, recovery attempts, and usage records in Postgres so failed runs can resume from the last safe point without moving execution into a hosted runtime.
+Your code still runs in your app, worker, or job process. Tidebase stores checkpoints, state, events, gates, channel deliveries, recovery attempts, and usage records in Postgres, so "this run died at step 7 — is it safe to rerun?" always has an answer.
+
+Docs: <https://tidebase.dev> · Community: [Discord](https://discord.gg/JQ5sutdP8Y) · For AI assistants: [/llms.txt](https://tidebase.dev/llms.txt)
 
 ## Why Tidebase
 
@@ -92,6 +94,29 @@ The `plan` and `fetch-sources` steps are returned from checkpoints. Only `write-
 <p align="center">
   <img src="docs/assets/crash-resume.gif" width="820" alt="Kill the process mid-run, re-invoke with the same run id, and the workflow resumes from the last checkpoint">
 </p>
+
+## Using Tidebase with AI coding agents
+
+Make every AI session in your project use Tidebase correctly:
+
+```bash
+npx tidebase init        # writes a Tidebase section into AGENTS.md/CLAUDE.md (idempotent)
+```
+
+Give your assistant direct access to runs, gates, and recovery via MCP:
+
+```bash
+claude mcp add tidebase -e TIDEBASE_URL=http://localhost:7373 -- npx -y @tidebase/mcp
+```
+
+Or install the Claude Code plugin (skill + MCP server in one):
+
+```
+/plugin marketplace add BlueprintLabIO/tidebase
+/plugin install tidebase@tidebase
+```
+
+Agent-readable docs live at [tidebase.dev/llms.txt](https://tidebase.dev/llms.txt); every docs page also serves a raw `.md` twin.
 
 ## Testing
 
@@ -366,6 +391,7 @@ Everything is backed by Postgres and designed for self-hosting from day one.
 
 - Postgres-backed run store
 - TypeScript SDK
+- Python SDK (`sdk-python/`)
 - SvelteKit Studio
 - live state set/patch
 - state history and labeled snapshots
@@ -395,6 +421,6 @@ This is ready for local demos and early feedback, not production.
 Important limits:
 
 - The server currently auto-runs the SQL schema on boot; a real migration runner is planned.
-- There is no API authentication yet. Run it only in trusted local/self-hosted environments.
+- API auth is opt-in: set `TIDEBASE_API_KEY` on the server and the SDK (Studio: `VITE_TIDEBASE_API_KEY`). Without it the API is open — use only in trusted local/self-hosted environments.
 - External side effects still need idempotency keys in user code.
 - Tidebase remembers what happened and can call recovery webhooks, but it does not guarantee that user code will be available to resume.

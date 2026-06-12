@@ -1,4 +1,4 @@
-import { createHmac, randomUUID } from 'node:crypto'
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { streamSSE } from 'hono/streaming'
@@ -9,6 +9,13 @@ import { appendEvent, listEvents, subscribe } from './events.js'
 const leaseMs = Number(process.env.TIDEBASE_LEASE_MS ?? 60_000)
 const webhookSecret = process.env.TIDEBASE_WEBHOOK_SECRET
 const publicUrl = (process.env.TIDEBASE_PUBLIC_URL ?? `http://localhost:${process.env.PORT ?? 7373}`).replace(/\/$/, '')
+
+function timingSafeEqualString(a: string, b: string) {
+  const aBuf = Buffer.from(a)
+  const bBuf = Buffer.from(b)
+  if (aBuf.length !== bBuf.length) return false
+  return timingSafeEqual(aBuf, bBuf)
+}
 
 const jsonRecord = z.record(z.string(), z.unknown())
 const channelSchema = z.object({
@@ -118,7 +125,12 @@ const gateResolveSchema = z.object({
   payload: z.unknown().optional()
 })
 
-export function createApp() {
+export type CreateAppOptions = {
+  apiKey?: string
+}
+
+export function createApp(options: CreateAppOptions = {}) {
+  const apiKey = options.apiKey ?? process.env.TIDEBASE_API_KEY
   const app = new Hono()
   app.use('*', cors())
   app.onError((error, c) => {
@@ -130,6 +142,22 @@ export function createApp() {
   })
 
   app.get('/health', (c) => c.json({ ok: true }))
+
+  // Shared-token auth: opt-in by setting TIDEBASE_API_KEY. /health stays open
+  // for probes. The SSE endpoint also accepts ?token= because EventSource
+  // cannot set request headers.
+  if (apiKey) {
+    app.use('*', async (c, next) => {
+      const header = c.req.header('authorization')
+      const bearer = header?.startsWith('Bearer ') ? header.slice('Bearer '.length) : null
+      const isEventStream = /^\/runs\/[^/]+\/events$/.test(c.req.path)
+      const candidate = bearer ?? (isEventStream ? c.req.query('token') ?? null : null)
+      if (!candidate || !timingSafeEqualString(candidate, apiKey)) {
+        return c.json({ error: 'unauthorized' }, 401)
+      }
+      await next()
+    })
+  }
 
   app.post('/runs/:workflowName', async (c) => {
     const workflowName = c.req.param('workflowName')
