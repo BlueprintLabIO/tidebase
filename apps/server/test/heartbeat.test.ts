@@ -77,16 +77,31 @@ describe('run lease heartbeat', () => {
     })
     const runId = claim.body.runs[0].id
 
-    // Heartbeats keep it claimed; the reconciler must not touch a live session.
+    // Heartbeats keep it claimed; the reconciler must not touch a live
+    // session. Heartbeat on a fast interval so the 250ms lease cannot lapse
+    // from test-suite load while the tick runs.
+    const hb = setInterval(() => {
+      void api(app, 'POST', `/runs/${runId}/heartbeat`, {
+        leaseOwner: claim.body.leaseOwner
+      }).catch(() => {})
+    }, 60)
     await sleep(150)
-    await api(app, 'POST', `/runs/${runId}/heartbeat`, { leaseOwner: claim.body.leaseOwner })
     await reconcileTick()
-    expect((await getRunDetail(app, runId)).run.status).toBe('running')
+    const live = (await getRunDetail(app, runId)).run.status
+    clearInterval(hb)
+    expect(live).toBe('running')
 
-    // The worker dies: heartbeats stop, the lease expires, the reconciler requeues.
+    // The worker dies: heartbeats stop, the lease expires, the reconciler
+    // requeues. Ticks share an advisory lock with other test files — retry
+    // until this tick actually runs.
     await sleep(400)
-    await reconcileTick()
-    expect((await getRunDetail(app, runId)).run.status).toBe('queued')
+    let status = (await getRunDetail(app, runId)).run.status
+    for (let i = 0; i < 40 && status !== 'queued'; i += 1) {
+      await reconcileTick()
+      await sleep(25)
+      status = (await getRunDetail(app, runId)).run.status
+    }
+    expect(status).toBe('queued')
 
     const stale = await api(app, 'POST', `/runs/${runId}/heartbeat`, {
       leaseOwner: claim.body.leaseOwner
@@ -95,6 +110,35 @@ describe('run lease heartbeat', () => {
     expect(stale.body.code).toBe('lease_lost')
 
     expect(enq.status).toBe(200)
+  })
+
+  it('expired plain runs cannot starve the reconciler sweep', async () => {
+    // Plain runs (no queue, no recovery webhook) are left running-with-expired-
+    // lease for manual takeover. More than a sweep-window's worth of them must
+    // not prevent an actionable queue run from being reclaimed.
+    for (let i = 0; i < 120; i += 1) {
+      const plain = await createRun(app, 'plain-clutter')
+      await api(app, 'POST', `/runs/${plain.id}/begin`, undefined, {
+        'x-tidebase-worker': `clutter-${i}`
+      })
+    }
+    await sleep(300) // all 120 plain leases expire
+
+    const queue = `q-${randomUUID().slice(0, 8)}`
+    const enq = await api(app, 'POST', `/queues/${queue}/enqueue`, {
+      workflowName: 'wf',
+      maxAttempts: 3
+    })
+    await api(app, 'POST', '/queues/claim', { queues: [queue], leaseOwner: 'w1' })
+    await sleep(300) // its lease expires too
+
+    let status = (await getRunDetail(app, enq.body.run.id)).run.status
+    for (let i = 0; i < 40 && status !== 'queued'; i += 1) {
+      await reconcileTick()
+      await sleep(25)
+      status = (await getRunDetail(app, enq.body.run.id)).run.status
+    }
+    expect(status).toBe('queued')
   })
 
   it('heartbeat on a cancelled run reports run_cancelled, not lease_lost', async () => {

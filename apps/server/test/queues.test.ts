@@ -137,18 +137,26 @@ describe('queue primitive', () => {
     // worker dies: expire the lease manually
     await pool.query(`update runs set lease_expires_at = now() - interval '1 second' where id = $1`, [runId])
 
-    const report1 = await reconcileTick()
-    expect(report1!.requeued).toBeGreaterThanOrEqual(1)
+    // Assert the run's state transition, not a single tick's report: ticks
+    // share an advisory lock across concurrently-running test files, and any
+    // tick may be the one that performs this run's transition.
     let detail = await getRunDetail(app, runId)
+    for (let i = 0; i < 40 && detail.run.status !== 'queued'; i += 1) {
+      await reconcileTick()
+      await new Promise((r) => setTimeout(r, 25))
+      detail = await getRunDetail(app, runId)
+    }
     expect(detail.run.status).toBe('queued')
 
     await pool.query(`update runs set run_at = now() where id = $1`, [runId])
     await api(app, 'POST', '/queues/claim', { queues: [queue], leaseOwner: 'dead-worker-2' })
     await pool.query(`update runs set lease_expires_at = now() - interval '1 second' where id = $1`, [runId])
 
-    const report2 = await reconcileTick()
-    expect(report2!.failed).toBeGreaterThanOrEqual(1)
-    detail = await getRunDetail(app, runId)
+    for (let i = 0; i < 40 && detail.run.status !== 'failed'; i += 1) {
+      await reconcileTick()
+      await new Promise((r) => setTimeout(r, 25))
+      detail = await getRunDetail(app, runId)
+    }
     expect(detail.run.status).toBe('failed')
     expect(detail.run.failureClass).toBe('max_retries')
   })

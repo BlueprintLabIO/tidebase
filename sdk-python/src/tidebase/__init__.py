@@ -26,6 +26,7 @@ import hashlib
 import hmac
 import json
 import os
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -37,6 +38,7 @@ from urllib import request as urlrequest
 __all__ = [
     "Tidebase",
     "RunContext",
+    "RunSession",
     "TidebaseError",
     "RunCancelled",
     "GateDecision",
@@ -355,6 +357,50 @@ class RunsClient:
     def recover(self, run_id: str, reason: str = "manual") -> dict:
         return self._client.request("POST", f"/runs/{run_id}/recover", {"reason": reason})
 
+    def attach(
+        self,
+        workflow_name: str,
+        *,
+        run_id: Optional[str] = None,
+        input: Any = None,
+        metadata: Optional[dict] = None,
+        recovery_webhook: Optional[str] = None,
+        channels: Optional[list] = None,
+        heartbeat_s: Optional[float] = 20.0,
+        on_lease_lost: Optional[Callable[[Exception], None]] = None,
+    ) -> "RunSession":
+        """Attach to a run as a session: acquire its lease and return a handle
+        whose step/gate/state calls stay valid until complete()/fail(). Use
+        when execution is not function-shaped — a protocol gateway, a REPL, a
+        run that spans many requests. Mirrors tide.run() semantics: omit
+        run_id to create, pass one to resume an existing run."""
+        if run_id is None:
+            run = self.create(
+                workflow_name,
+                input=input,
+                metadata=metadata,
+                recovery_webhook=recovery_webhook,
+                channels=channels,
+            )
+        else:
+            run = self.get(run_id)["run"]
+
+        if run["workflowName"] != workflow_name:
+            raise ValueError(
+                f"Run {run['id']} belongs to workflow {run['workflowName']}, not {workflow_name}"
+            )
+        if run["status"] == "completed":
+            raise RuntimeError(f"Run {run['id']} is already completed")
+
+        begin = self._client.request("POST", f"/runs/{run['id']}/begin")
+        return RunSession(
+            self._client,
+            begin["run"],
+            begin["leaseOwner"],
+            heartbeat_s=heartbeat_s,
+            on_lease_lost=on_lease_lost,
+        )
+
     def cancel(self, run_id: str, reason: Optional[str] = None, actor: Optional[str] = None) -> dict:
         """Cancel a run: authoritative and one-way. In-flight workers observe
         it at their next step/gate boundary."""
@@ -439,6 +485,7 @@ class RunContext:
         self.state = RunState(client, run_id)
         self.usage = RunUsage(client, run_id)
         self.snapshots = RunSnapshots(client, run_id)
+        self.gates = RunGates(client, run_id)
 
     # ---- steps -----------------------------------------------------------
 
@@ -657,6 +704,123 @@ class RunContext:
             replay="auto",
             checkpoint_invariant="all child run results were collected",
         )
+
+
+class RunSession(RunContext):
+    """A run handle for session-shaped work: open-ended execution that is not
+    a single workflow function (protocol gateways, REPLs, runs spanning many
+    requests). Holds the run lease via a background heartbeat and reports the
+    terminal state explicitly through complete()/fail(). If the process dies,
+    the heartbeat stops, the lease expires, and the reconciler takes over —
+    exactly as if a workflow worker had crashed."""
+
+    def __init__(
+        self,
+        client: Tidebase,
+        run: dict,
+        lease_owner: str,
+        *,
+        heartbeat_s: Optional[float] = 20.0,
+        on_lease_lost: Optional[Callable[[Exception], None]] = None,
+    ):
+        super().__init__(client, run["id"], lease_owner)
+        self.run = run
+        self._hb_stop = threading.Event()
+        self._hb_thread: Optional[threading.Thread] = None
+        if heartbeat_s:
+            def _loop() -> None:
+                while not self._hb_stop.wait(heartbeat_s):
+                    try:
+                        self.heartbeat()
+                    except Exception as error:  # lease lost, cancelled, or unreachable
+                        self._hb_stop.set()
+                        if on_lease_lost is not None:
+                            on_lease_lost(error)
+                        return
+
+            self._hb_thread = threading.Thread(
+                target=_loop, name=f"tidebase-heartbeat-{run['id']}", daemon=True
+            )
+            self._hb_thread.start()
+
+    def heartbeat(self) -> dict:
+        """Renew the run lease once. Raises if the lease was lost — the session
+        is then a zombie and the server fences its writes."""
+        return self._client.request(
+            "POST", f"/runs/{self.run_id}/heartbeat", {"leaseOwner": self._lease_owner}
+        )
+
+    def complete(self, result: Any = None) -> dict:
+        self.close()
+        return self._client.request(
+            "POST", f"/runs/{self.run_id}/complete", {"result": result}
+        )
+
+    def fail(self, error: Any) -> dict:
+        self.close()
+        body = (
+            _serialize_error(error)
+            if isinstance(error, BaseException)
+            else {"message": str(error)}
+        )
+        return self._client.request("POST", f"/runs/{self.run_id}/fail", {"error": body})
+
+    def close(self) -> None:
+        """Stop heartbeating without reporting a terminal state. The lease
+        expires on its own and the reconciler reclaims the run."""
+        self._hb_stop.set()
+
+
+def _map_gate(gate: dict) -> dict:
+    return {
+        "gateId": gate["id"],
+        "name": gate["name"],
+        "status": gate["status"],
+        "decision": gate.get("decision"),
+        "actor": gate.get("actor"),
+        "payload": gate.get("decisionPayload"),
+    }
+
+
+class RunGates:
+    """Non-blocking gate primitives; RunContext.gate() is the blocking
+    convenience built on the same endpoints. Use these when you cannot block
+    on a human (an HTTP handler, a bot, a protocol gateway)."""
+
+    def __init__(self, client: Tidebase, run_id: str):
+        self._client = client
+        self._run_id = run_id
+
+    def begin(
+        self,
+        name: str,
+        prompt: str,
+        *,
+        data: Any = None,
+        channels: Optional[list] = None,
+        capability: Optional[dict] = None,
+        timeout_s: Optional[float] = None,
+    ) -> dict:
+        """Open (or rejoin) a gate without blocking on its resolution.
+        Idempotent per gate name within a run: re-beginning a resolved gate
+        returns its decision immediately, so retried callers converge."""
+        body: dict = {
+            "name": name,
+            "prompt": prompt,
+            "data": data if data is not None else {},
+            "channels": channels or [],
+            "capability": capability,
+        }
+        if timeout_s is not None:
+            body["timeoutMs"] = int(timeout_s * 1000)
+        begun = self._client.request("POST", f"/runs/{self._run_id}/gates/begin", body)
+        return _map_gate(begun["gate"])
+
+    def get(self, gate_id: str) -> dict:
+        polled = self._client.request("GET", f"/runs/{self._run_id}/gates/{gate_id}")
+        if polled.get("runStatus") == "cancelled":
+            raise RunCancelled(self._run_id)
+        return _map_gate(polled["gate"])
 
 
 class RunState:

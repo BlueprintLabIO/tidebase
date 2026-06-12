@@ -37,6 +37,8 @@ Re-invoke with the same `run_id` after a crash: completed steps return from thei
 | `run.child(...)` / `run.fanout(name, children)` | Subagents as child runs, idempotent by edge name, durable join |
 | `run.usage.record(kind=…, input_tokens=…, cost_usd=…)` | Per-run token/cost ledger, no LLM proxy |
 | `tide.runs.create / get / list / recover / subscribe` | Run API + SSE event stream |
+| `tide.runs.attach(name, run_id=…, heartbeat_s=…)` | Session runs (v0.6): a RunSession holding the lease via background heartbeat, with `complete()` / `fail()` — for gateways, REPLs, multi-request runs |
+| `run.gates.begin(name, prompt) / run.gates.get(gate_id)` | Non-blocking gates (v0.6): begin is idempotent per name; retried callers converge on one decision |
 | `tidebase.verify_webhook_signature(body, header, secret)` | Verify signed recovery/channel webhooks |
 
 External writes should declare `side_effects` and an `idempotency_key`; otherwise a final failure is classified `manual_review` instead of silently retrying — that's the [replay contract](https://tidebase.dev/docs/replay-contract-is-it-safe-to-rerun/).

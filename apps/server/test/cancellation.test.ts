@@ -93,10 +93,15 @@ describe('cancellation lifecycle', () => {
     })
     expect(enqueue.status).toBe(200)
     await new Promise((r) => setTimeout(r, 5))
-    const report = await reconcileTick()
-    expect(report).not.toBeNull()
-    expect(report!.cancelledByDeadline).toBeGreaterThanOrEqual(1)
-    const detail = await getRunDetail(app, enqueue.body.run.id)
+    // Ticks share one advisory lock across concurrently-running test files; a
+    // null report means the lock was momentarily held elsewhere, not that the
+    // deadline sweep failed — retry until this run's cancel lands.
+    let detail = await getRunDetail(app, enqueue.body.run.id)
+    for (let i = 0; i < 40 && detail.run.status !== 'cancelled'; i += 1) {
+      await reconcileTick()
+      await new Promise((r) => setTimeout(r, 25))
+      detail = await getRunDetail(app, enqueue.body.run.id)
+    }
     expect(detail.run.status).toBe('cancelled')
     expect(detail.run.cancelReason).toBe('deadline')
   })

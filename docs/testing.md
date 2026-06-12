@@ -29,6 +29,7 @@ The SDK unit tests (`packages/sdk/test`) need no infrastructure.
 | Step/run leases are mutually exclusive while live, and completions are fenced by `leaseOwner` | At most one worker executes a step; zombie workers cannot write back stale results | `steps.test.ts`, `lease-expiry.test.ts` |
 | Expired leases can be taken over; the original owner is fenced out afterwards | Crash recovery without double execution | `lease-expiry.test.ts` |
 | Heartbeat extends a held lease without bumping `attempt` or appending events; it never resurrects a lost lease (takeover, reconciler reclaim, or cancel → 409) | Session-shaped runs stay owned while alive and become reclaimable the moment they die | `heartbeat.test.ts` |
+| The lease sweep selects only actionable rows (queue or webhook runs), oldest first — expired plain runs cannot starve it | A clogged sweep window would silently stop crash recovery on long-lived databases | `heartbeat.test.ts` |
 | Concurrent first-begins of a step grant `execute` to exactly one worker | Lease exclusivity must hold before the row exists, not just after | `steps.test.ts` (advisory lock in `steps/begin`) |
 | Failure classification: unkeyed side effects → `manual_review`, idempotency key or read-only → `safe_replay`, `replay: never` → `fail_hard` | The resume contract users trust for money-moving steps | `steps.test.ts` |
 | The per-run event log is gap-free and strictly ordered, even under concurrent writers | Studio timeline and audit trail correctness | `state-events.test.ts` (advisory lock in `appendEvent`) |

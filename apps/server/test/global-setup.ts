@@ -29,5 +29,17 @@ export default async function setup() {
   for (const file of files) {
     await client.query(await readFile(resolve(migrationsDir, file), 'utf8'))
   }
+
+  // Start every suite run from empty tables: rows accumulated by previous
+  // runs (e.g. expired-lease runs) otherwise change reconciler and stats
+  // behavior between runs.
+  const tables = await client.query(
+    `select tablename from pg_tables
+     where schemaname = 'public' and tablename <> 'schema_migrations'`
+  )
+  if (tables.rows.length > 0) {
+    const names = tables.rows.map((r) => `"${r.tablename}"`).join(', ')
+    await client.query(`truncate ${names} restart identity cascade`)
+  }
   await client.end()
 }

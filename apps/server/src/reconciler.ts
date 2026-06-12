@@ -52,9 +52,15 @@ export async function reconcileTick(now = new Date()): Promise<TickReport | null
 }
 
 async function sweepExpiredLeases(report: TickReport, now: Date) {
+  // Only actionable rows: a plain run (no queue, no recovery webhook) is
+  // deliberately left running-with-expired-lease for manual takeover, so it
+  // must not occupy the sweep window — otherwise enough of them permanently
+  // starve the limit-100 sweep and queue/webhook runs are never reclaimed.
   const expired = await pool.query(
     `select * from runs
      where status = 'running' and lease_expires_at is not null and lease_expires_at < $1
+       and (queue_name is not null or recovery_webhook is not null)
+     order by lease_expires_at
      limit 100`,
     [now]
   )

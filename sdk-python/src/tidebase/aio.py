@@ -30,13 +30,14 @@ from . import (
     GateDecision,
     RunCancelled,
     RunContext,
+    RunSession,
     Tidebase,
     _classify_resume_decision,
     _hash_stable,
     _serialize_error,
 )
 
-__all__ = ["AsyncTidebase", "AsyncRunContext"]
+__all__ = ["AsyncTidebase", "AsyncRunContext", "AsyncRunSession"]
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -163,6 +164,34 @@ class AsyncRunContext:
         return await asyncio.to_thread(self._inner.usage.record, **options)
 
 
+class AsyncRunSession(AsyncRunContext):
+    """Async view of a session run (see tidebase.RunSession): same step/gate/
+    state surface as AsyncRunContext, plus explicit lifecycle. The lease
+    heartbeat runs on its own daemon thread either way."""
+
+    def __init__(self, inner: RunSession):
+        super().__init__(inner)
+        self.run = inner.run
+
+    async def heartbeat(self) -> dict:
+        return await asyncio.to_thread(self._inner.heartbeat)
+
+    async def complete(self, result: Any = None) -> dict:
+        return await asyncio.to_thread(self._inner.complete, result)
+
+    async def fail(self, error: Any) -> dict:
+        return await asyncio.to_thread(self._inner.fail, error)
+
+    def close(self) -> None:
+        self._inner.close()
+
+    async def gates_begin(self, name: str, prompt: str, **options: Any) -> dict:
+        return await asyncio.to_thread(self._inner.gates.begin, name, prompt, **options)
+
+    async def gates_get(self, gate_id: str) -> dict:
+        return await asyncio.to_thread(self._inner.gates.get, gate_id)
+
+
 class AsyncTidebase:
     def __init__(self, url: Optional[str] = None, api_key: Optional[str] = None):
         self._sync = Tidebase(url=url, api_key=api_key)
@@ -227,6 +256,14 @@ class AsyncTidebase:
             except Exception:
                 pass
             raise
+
+    async def attach(self, workflow_name: str, **options: Any) -> AsyncRunSession:
+        """Async counterpart of tide.runs.attach(): returns an AsyncRunSession
+        holding the run lease via a background heartbeat."""
+        session = await asyncio.to_thread(
+            self._sync.runs.attach, workflow_name, **options
+        )
+        return AsyncRunSession(session)
 
     async def enqueue(self, workflow_name: str, **options: Any) -> dict:
         return await asyncio.to_thread(self._sync.enqueue, workflow_name, **options)

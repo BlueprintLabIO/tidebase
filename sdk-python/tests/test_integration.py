@@ -268,5 +268,72 @@ class PythonSdkV05(unittest.TestCase):
         self.assertEqual(calls["n"], 1, "async step re-executed on replay")
 
 
+@unittest.skipUnless(server_up(), f"Tidebase server not reachable at {SERVER}")
+class PythonSdkV06Sessions(unittest.TestCase):
+    """v0.6 surfaces: session runs (attach/heartbeat) and non-blocking gates."""
+
+    def setUp(self):
+        self.tide = Tidebase(url=SERVER)
+
+    def test_session_attach_step_replay_complete(self):
+        """Invariant: a session is a full run context — steps checkpoint and
+        replay; complete() is terminal; re-attach to a completed run refuses."""
+        calls = {"n": 0}
+        session = self.tide.runs.attach("py-session", input={"kind": "test"})
+
+        def work():
+            calls["n"] += 1
+            return "tool-result"
+
+        first = session.step("call:abc123", work, input={"q": 1})
+        again = session.step("call:abc123", work, input={"q": 1})
+        self.assertEqual((first, again), ("tool-result", "tool-result"))
+        self.assertEqual(calls["n"], 1, "checkpointed step re-executed in session")
+
+        session.complete({"calls": 1})
+        with self.assertRaises(RuntimeError):
+            self.tide.runs.attach("py-session", run_id=session.run_id)
+
+    def test_session_heartbeat_fenced_after_terminal(self):
+        """Invariant: heartbeat renews a live lease and refuses after the run
+        is terminal — a finished session cannot keep itself alive."""
+        session = self.tide.runs.attach("py-session-hb", heartbeat_s=None)
+        session.heartbeat()  # live lease renews fine
+        session.complete(None)
+        from tidebase import TidebaseError
+
+        with self.assertRaises(TidebaseError) as ctx:
+            session.heartbeat()
+        self.assertEqual(ctx.exception.status, 409)
+
+    def test_nonblocking_gates_rejoin_returns_decision(self):
+        """Invariant: gates.begin is idempotent per name — pending first, and
+        after resolution a re-begin returns the decision without blocking."""
+        session = self.tide.runs.attach("py-session-gate", heartbeat_s=None)
+        gate = session.gates.begin("approve:xyz", "Approve?", data={"x": 1})
+        self.assertEqual(gate["status"], "pending")
+        self.assertIsNone(gate["decision"])
+
+        detail = self.tide.runs.get(session.run_id)
+        raw = detail["gates"][0]
+        body = jsonlib.dumps(
+            {"token": raw["resolveToken"], "decision": "approved", "actor": "pytest"}
+        ).encode()
+        req = urllib.request.Request(
+            f"{SERVER}/runs/{session.run_id}/gates/{raw['id']}/resolve",
+            data=body,
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req) as r:
+            self.assertEqual(r.status, 200)
+
+        rejoined = session.gates.begin("approve:xyz", "Approve?", data={"x": 1})
+        self.assertEqual(rejoined["decision"], "approved")
+        polled = session.gates.get(rejoined["gateId"])
+        self.assertEqual(polled["decision"], "approved")
+        session.complete(None)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
