@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs'
 import { readdir, readFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -10,7 +11,12 @@ export const pool = new pg.Pool({
 })
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
-const migrationsDir = resolve(__dirname, '../../../migrations')
+// Monorepo layout keeps migrations at the repo root; the published package
+// ships its own copy (see prepack) one level above src/dist.
+const migrationsDir = [
+  resolve(__dirname, '../../../migrations'),
+  resolve(__dirname, '../migrations')
+].find(existsSync) ?? resolve(__dirname, '../../../migrations')
 
 // Versioned migration runner. Files in migrations/ are applied in
 // lexicographic order, exactly once, recorded in schema_migrations, under an
@@ -19,8 +25,8 @@ const migrationsDir = resolve(__dirname, '../../../migrations')
 // fail fast when migrations are pending (expand/contract deploy discipline).
 const MIGRATION_LOCK = 0x74646201 // 'tdb' 01
 
-export async function migrate() {
-  const client = await pool.connect()
+export async function migrate(target: pg.Pool = pool) {
+  const client = await target.connect()
   try {
     await client.query('select pg_advisory_lock($1)', [MIGRATION_LOCK])
     await client.query(
@@ -53,21 +59,21 @@ export async function migrate() {
   }
 }
 
-export async function pendingMigrations() {
-  const exists = await pool.query(
+export async function pendingMigrations(target: pg.Pool = pool) {
+  const exists = await target.query(
     `select 1 from information_schema.tables where table_name = 'schema_migrations'`
   )
   const applied = exists.rows[0]
     ? new Set(
-        (await pool.query('select name from schema_migrations')).rows.map((r) => r.name)
+        (await target.query('select name from schema_migrations')).rows.map((r) => r.name)
       )
     : new Set<string>()
   const files = (await readdir(migrationsDir)).filter((f) => f.endsWith('.sql')).sort()
   return files.filter((f) => !applied.has(f))
 }
 
-export async function tx<T>(fn: (client: pg.PoolClient) => Promise<T>) {
-  const client = await pool.connect()
+export async function tx<T>(fn: (client: pg.PoolClient) => Promise<T>, target: pg.Pool = pool) {
+  const client = await target.connect()
   try {
     await client.query('begin')
     const result = await fn(client)

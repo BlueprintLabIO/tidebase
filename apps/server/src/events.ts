@@ -58,8 +58,8 @@ export async function appendEvent(
   return event
 }
 
-export async function listEvents(runId: string, afterSeq = 0) {
-  const result = await pool.query(
+export async function listEvents(runId: string, afterSeq = 0, target: pg.Pool = pool) {
+  const result = await target.query(
     `select id, run_id, seq, type, payload_json, created_at
      from events
      where run_id = $1 and seq > $2
