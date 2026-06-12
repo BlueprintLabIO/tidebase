@@ -40,6 +40,14 @@ The SDK unit tests (`packages/sdk/test`) need no infrastructure.
 | Channel deliveries are signed, filtered by event list, recorded win-or-lose, and dispatched after commit — a slow endpoint never blocks other writers to the run | Channels must observe runs without being able to stall them | `channels.test.ts` |
 | The SDK's resume classification matches the server's: plain/read-only → `safe_replay`, unkeyed writes → `manual_review`, keyed writes → `safe_replay` | Both sides of the wire must agree on the safety contract | `e2e-recovery.test.ts` |
 | With `TIDEBASE_API_KEY` set, every surface except `/health` rejects missing/wrong/malformed credentials (timing-safe compare); `?token=` is honored on the SSE endpoint only; with no key configured the API stays open | Auth must fail closed without breaking probes, EventSource, or trusted local setups | `auth.test.ts` |
+| Cancellation is authoritative, one-way, idempotent, observable at step/gate boundaries, and refuses resurrection via complete/fail | Lifecycle truth has one owner; user code cannot miss a cancel | `cancellation.test.ts` |
+| Dedupe admits exactly one active run per (queue, dedupeKey) under concurrent enqueues; terminal runs free the key | Retried enqueues cannot double-charge | `queues.test.ts` |
+| Concurrent claimers receive disjoint runs; per-queue concurrency caps and rate limits hold across competing claims | Pull dispatch is exactly-once per job under contention | `queues.test.ts` |
+| Failed queue runs requeue with backoff while attempts remain, then classify `max_retries`; expired leases requeue or fail via the reconciler | Worker death is a lifecycle transition, not a stuck row | `queues.test.ts` |
+| A due schedule enqueues exactly once across concurrent reconciler ticks (fire-time dedupe key) and advances next_run_at | Cron double-fires are structurally impossible | `schedules.test.ts` |
+| Push-mode dispatch records signed run.invoke deliveries win-or-lose and never double-dispatches within the redelivery horizon | At-least-once with a bounded duplicate window | `schedules.test.ts` |
+| Deadlines cancel overdue runs with reason `deadline` via the reconciler | Timeouts are durable and externally visible | `cancellation.test.ts` |
+| The SDK work loop executes registered workflows off claimed runs, and a gate-blocked worker unwinds with RunCancelledError on cancel | The client honors the same lifecycle the server enforces | `e2e-queues.test.ts` |
 
 ## Conventions
 

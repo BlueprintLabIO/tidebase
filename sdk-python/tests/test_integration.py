@@ -178,5 +178,95 @@ class PythonSdkInvariants(unittest.TestCase):
         self.assertEqual(child_runs["n"], 2)
 
 
+@unittest.skipUnless(server_up(), f"Tidebase server not reachable at {SERVER}")
+class PythonSdkV05(unittest.TestCase):
+    """v0.5 surfaces: queues, cancellation, schedules, async."""
+
+    def setUp(self):
+        self.tide = Tidebase(url=SERVER)
+        self.queue = "py-" + new_run_id()[-8:]
+
+    def test_enqueue_work_executes_registered_workflow(self):
+        @self.tide.workflow("py-queued-wf")
+        def wf(run, input):
+            return run.step("double", lambda: input["n"] * 2)
+
+        enq = self.tide.enqueue("py-queued-wf", queue=self.queue, input={"n": 21})
+        self.assertEqual(enq["run"]["status"], "queued")
+
+        done = {"stop": False}
+        worker = threading.Thread(
+            target=lambda: self.tide.work([self.queue], poll_s=0.1, stop=lambda: done["stop"])
+        )
+        worker.start()
+        try:
+            for _ in range(100):
+                if self.tide.runs.get(enq["run"]["id"])["run"]["status"] == "completed":
+                    break
+                time.sleep(0.1)
+        finally:
+            done["stop"] = True
+            worker.join(timeout=5)
+
+        detail = self.tide.runs.get(enq["run"]["id"])
+        self.assertEqual(detail["run"]["status"], "completed")
+        self.assertEqual(detail["run"]["result"], 42)
+
+    def test_dedupe_and_cancel(self):
+        a = self.tide.enqueue("py-dedupe-wf", queue=self.queue, dedupe_key="only-one")
+        b = self.tide.enqueue("py-dedupe-wf", queue=self.queue, dedupe_key="only-one")
+        self.assertEqual(a["run"]["id"], b["run"]["id"])
+        self.assertTrue(b["deduplicated"])
+
+        cancelled = self.tide.runs.cancel(a["run"]["id"], reason="not needed", actor="pytest")
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["cancelReason"], "not needed")
+        # idempotent
+        again = self.tide.runs.cancel(a["run"]["id"])
+        self.assertEqual(again["status"], "cancelled")
+
+    def test_schedule_round_trip(self):
+        name = "py-sched-" + new_run_id()[-8:]
+        schedule = self.tide.schedules.set(
+            name, cron="0 9 * * *", workflow_name="py-digest", queue=self.queue
+        )
+        self.assertEqual(schedule["cron"], "0 9 * * *")
+        self.assertIsNotNone(schedule["nextRunAt"])
+        names = [s["name"] for s in self.tide.schedules.list()]
+        self.assertIn(name, names)
+        self.tide.schedules.delete(name)
+        names = [s["name"] for s in self.tide.schedules.list()]
+        self.assertNotIn(name, names)
+
+    def test_async_workflow_with_async_steps(self):
+        import asyncio
+        from tidebase.aio import AsyncTidebase
+
+        atide = AsyncTidebase(url=SERVER)
+        calls = {"n": 0}
+
+        async def slow_double(x):
+            await asyncio.sleep(0.01)
+            calls["n"] += 1
+            return x * 2
+
+        @atide.workflow("py-async-wf")
+        async def wf(run, input):
+            a = await run.step("sync-step", lambda: input["n"] + 1)
+            b = await run.step("async-step", lambda: slow_double(a))
+            await run.state_set({"status": "done", "b": b})
+            return b
+
+        result = asyncio.run(atide.run("py-async-wf", input={"n": 20}))
+        self.assertEqual(result, 42)
+        self.assertEqual(calls["n"], 1)
+
+        # resume replays both steps without re-executing the async one
+        runs = [r for r in self.tide.runs.list() if r["workflowName"] == "py-async-wf"]
+        rerun = asyncio.run(atide.run("py-async-wf", run_id=runs[0]["id"]))
+        self.assertEqual(rerun, 42)
+        self.assertEqual(calls["n"], 1, "async step re-executed on replay")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

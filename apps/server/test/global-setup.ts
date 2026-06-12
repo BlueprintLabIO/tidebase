@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises'
+import { readFile, readdir } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
@@ -21,12 +21,13 @@ export default async function setup() {
   }
   await admin.end()
 
+  // Apply every migration in order, mirroring the server's runner.
   const client = new pg.Client({ connectionString: testDatabaseUrl })
   await client.connect()
-  const migrationPath = resolve(
-    dirname(fileURLToPath(import.meta.url)),
-    '../../../migrations/001_init.sql'
-  )
-  await client.query(await readFile(migrationPath, 'utf8'))
+  const migrationsDir = resolve(dirname(fileURLToPath(import.meta.url)), '../../../migrations')
+  const files = (await readdir(migrationsDir)).filter((f) => f.endsWith('.sql')).sort()
+  for (const file of files) {
+    await client.query(await readFile(resolve(migrationsDir, file), 'utf8'))
+  }
   await client.end()
 }

@@ -38,6 +38,7 @@ __all__ = [
     "Tidebase",
     "RunContext",
     "TidebaseError",
+    "RunCancelled",
     "GateDecision",
     "new_run_id",
     "verify_webhook_signature",
@@ -52,6 +53,14 @@ class TidebaseError(RuntimeError):
         self.status = status
         self.body = body
         self.path = path
+
+
+class RunCancelled(RuntimeError):
+    """The run was cancelled while this worker held it. Let it propagate."""
+
+    def __init__(self, run_id: str):
+        super().__init__(f"Run {run_id} was cancelled")
+        self.run_id = run_id
 
 
 class GateDecision:
@@ -140,6 +149,20 @@ class Tidebase:
         self.api_key = api_key or os.environ.get("TIDEBASE_API_KEY")
         self.webhook_secret = webhook_secret or os.environ.get("TIDEBASE_WEBHOOK_SECRET")
         self.runs = RunsClient(self)
+        self.queues = QueuesClient(self)
+        self.schedules = SchedulesClient(self)
+        self._workflows: dict = {}
+
+    def workflow(self, name: str, fn: Optional[Callable] = None):
+        """Register a workflow for the work loop / webhook handler. Usable as
+        a decorator: @tide.workflow("generate-report")."""
+        if fn is None:
+            def decorator(f):
+                self._workflows[name] = f
+                return f
+            return decorator
+        self._workflows[name] = fn
+        return fn
 
     # ---- transport -------------------------------------------------------
 
@@ -153,7 +176,15 @@ class Tidebase:
             with urlrequest.urlopen(req) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urlerror.HTTPError as e:
-            raise TidebaseError(e.code, e.read().decode("utf-8", "replace"), path) from None
+            body_text = e.read().decode("utf-8", "replace")
+            try:
+                if json.loads(body_text).get("code") == "run_cancelled":
+                    parts = path.split("/")
+                    run_id = parts[2] if len(parts) > 2 and parts[1] == "runs" else "unknown"
+                    raise RunCancelled(run_id) from None
+            except (ValueError, KeyError, AttributeError):
+                pass
+            raise TidebaseError(e.code, body_text, path) from None
 
     # ---- workflows -------------------------------------------------------
 
@@ -191,17 +222,103 @@ class Tidebase:
             return run["result"]
 
         begin = self.request("POST", f"/runs/{run['id']}/begin")
-        context = RunContext(self, run["id"], begin["leaseOwner"])
+        return self._execute(run["id"], run["input"], begin["leaseOwner"], workflow)
+
+    def _execute(self, run_id: str, input: Any, lease_owner: str, workflow: Callable) -> Any:
+        context = RunContext(self, run_id, lease_owner)
         try:
-            result = workflow(context, run["input"])
-            self.request("POST", f"/runs/{run['id']}/complete", {"result": result})
+            result = workflow(context, input)
+            self.request("POST", f"/runs/{run_id}/complete", {"result": result})
             return result
+        except RunCancelled:
+            # The run is already terminal — never report failure after cancel.
+            raise
         except BaseException as error:
             try:
-                self.request("POST", f"/runs/{run['id']}/fail", {"error": _serialize_error(error)})
+                self.request("POST", f"/runs/{run_id}/fail", {"error": _serialize_error(error)})
             except Exception:
                 pass
             raise
+
+    def enqueue(
+        self,
+        workflow_name: str,
+        *,
+        queue: str = "default",
+        input: Any = None,
+        metadata: Optional[dict] = None,
+        dedupe_key: Optional[str] = None,
+        delay_s: Optional[float] = None,
+        run_at: Optional[str] = None,
+        max_attempts: Optional[int] = None,
+        priority: Optional[int] = None,
+        deadline_s: Optional[float] = None,
+        recovery_webhook: Optional[str] = None,
+    ) -> dict:
+        """Enqueue a workflow as a durable queued run. Returns
+        {"run": ..., "deduplicated": bool}."""
+        body: dict = {"workflowName": workflow_name}
+        if input is not None:
+            body["input"] = input
+        if metadata is not None:
+            body["metadata"] = metadata
+        if dedupe_key is not None:
+            body["dedupeKey"] = dedupe_key
+        if delay_s is not None:
+            body["delayMs"] = int(delay_s * 1000)
+        if run_at is not None:
+            body["runAt"] = run_at
+        if max_attempts is not None:
+            body["maxAttempts"] = max_attempts
+        if priority is not None:
+            body["priority"] = priority
+        if deadline_s is not None:
+            body["deadlineMs"] = int(deadline_s * 1000)
+        if recovery_webhook is not None:
+            body["recoveryWebhook"] = recovery_webhook
+        return self.request("POST", f"/queues/{urlparse.quote(queue, safe='')}/enqueue", body)
+
+    def work(
+        self,
+        queues: Optional[list] = None,
+        *,
+        lease_owner: Optional[str] = None,
+        poll_s: float = 1.0,
+        limit: int = 1,
+        stop: Optional[Callable[[], bool]] = None,
+        on_error: Optional[Callable[[BaseException, dict], None]] = None,
+    ) -> None:
+        """Pull-mode worker loop: claim ready runs and execute their
+        registered workflows (register with @tide.workflow). Runs until
+        stop() returns True."""
+        queues = queues or ["default"]
+        while not (stop and stop()):
+            claim = self.request(
+                "POST",
+                "/queues/claim",
+                {"queues": queues, "leaseOwner": lease_owner, "limit": limit}
+                if lease_owner
+                else {"queues": queues, "limit": limit},
+            )
+            for run in claim["runs"]:
+                workflow = self._workflows.get(run["workflowName"])
+                if workflow is None:
+                    try:
+                        self.request(
+                            "POST",
+                            f"/runs/{run['id']}/fail",
+                            {"error": {"message": f"no workflow registered for {run['workflowName']}"}},
+                        )
+                    except Exception:
+                        pass
+                    continue
+                try:
+                    self._execute(run["id"], run["input"], claim["leaseOwner"], workflow)
+                except BaseException as error:
+                    if on_error:
+                        on_error(error, run)
+            if not claim["runs"]:
+                time.sleep(poll_s)
 
 
 class RunsClient:
@@ -238,6 +355,16 @@ class RunsClient:
     def recover(self, run_id: str, reason: str = "manual") -> dict:
         return self._client.request("POST", f"/runs/{run_id}/recover", {"reason": reason})
 
+    def cancel(self, run_id: str, reason: Optional[str] = None, actor: Optional[str] = None) -> dict:
+        """Cancel a run: authoritative and one-way. In-flight workers observe
+        it at their next step/gate boundary."""
+        body: dict = {}
+        if reason is not None:
+            body["reason"] = reason
+        if actor is not None:
+            body["actor"] = actor
+        return self._client.request("POST", f"/runs/{run_id}/cancel", body)["run"]
+
     def subscribe(self, run_id: str, after: int = 0) -> Iterator[dict]:
         """Yield run events from the SSE stream (blocking generator)."""
         token = f"&token={urlparse.quote(self._client.api_key)}" if self._client.api_key else ""
@@ -248,6 +375,60 @@ class RunsClient:
                 line = raw.decode("utf-8").rstrip("\n")
                 if line.startswith("data:"):
                     yield json.loads(line[len("data:"):].strip())
+
+
+class QueuesClient:
+    def __init__(self, client: "Tidebase"):
+        self._client = client
+
+    def configure(
+        self,
+        name: str,
+        *,
+        concurrency: Optional[int] = None,
+        rate_per_minute: Optional[int] = None,
+        invoke_url: Optional[str] = None,
+    ) -> dict:
+        body: dict = {}
+        if concurrency is not None:
+            body["concurrency"] = concurrency
+        if rate_per_minute is not None:
+            body["ratePerMinute"] = rate_per_minute
+        if invoke_url is not None:
+            body["invokeUrl"] = invoke_url
+        return self._client.request("PUT", f"/queues/{urlparse.quote(name, safe='')}/config", body)
+
+    def list(self) -> list:
+        return self._client.request("GET", "/queues")["queues"]
+
+
+class SchedulesClient:
+    def __init__(self, client: "Tidebase"):
+        self._client = client
+
+    def set(
+        self,
+        name: str,
+        *,
+        cron: str,
+        workflow_name: str,
+        input: Any = None,
+        queue: str = "default",
+        max_attempts: Optional[int] = None,
+        enabled: bool = True,
+    ) -> dict:
+        body: dict = {"cron": cron, "workflowName": workflow_name, "queue": queue, "enabled": enabled}
+        if input is not None:
+            body["input"] = input
+        if max_attempts is not None:
+            body["maxAttempts"] = max_attempts
+        return self._client.request("PUT", f"/schedules/{urlparse.quote(name, safe='')}", body)["schedule"]
+
+    def list(self) -> list:
+        return self._client.request("GET", "/schedules")["schedules"]
+
+    def delete(self, name: str) -> dict:
+        return self._client.request("DELETE", f"/schedules/{urlparse.quote(name, safe='')}")
 
 
 class RunContext:
@@ -318,6 +499,8 @@ class RunContext:
         current = begin()
         if current["action"] == "return":
             return current["output"]
+        if current["action"] == "cancelled":
+            raise RunCancelled(self.run_id)
         if current["action"] == "input_mismatch":
             raise ValueError(
                 f"Step {name} input hash changed for this run. "
@@ -334,6 +517,8 @@ class RunContext:
                 current = begin()
                 if current["action"] == "return":
                     return current["output"]
+                if current["action"] == "cancelled":
+                    raise RunCancelled(self.run_id)
                 if current["action"] == "locked":
                     raise RuntimeError(f"Step {name} is currently leased by another worker")
                 if current["action"] == "input_mismatch":
@@ -399,7 +584,10 @@ class RunContext:
             if deadline and time.monotonic() > deadline:
                 raise TimeoutError(f"Gate {name} timed out")
             time.sleep(poll_s)
-            gate = self._client.request("GET", f"/runs/{self.run_id}/gates/{gate['id']}")["gate"]
+            polled = self._client.request("GET", f"/runs/{self.run_id}/gates/{gate['id']}")
+            if polled.get("runStatus") == "cancelled":
+                raise RunCancelled(self.run_id)
+            gate = polled["gate"]
 
         if gate["decision"] not in ("approved", "rejected", "canceled"):
             raise RuntimeError(f"Gate {name} resolved with unsupported decision {gate['decision']}")

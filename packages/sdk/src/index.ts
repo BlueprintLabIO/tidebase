@@ -65,6 +65,17 @@ export type TideRun = {
   status: string
   result: unknown
   error: unknown
+  queue?: string | null
+  dedupeKey?: string | null
+  priority?: number
+  runAt?: string | null
+  maxAttempts?: number
+  deadlineAt?: string | null
+  cancelRequestedAt?: string | null
+  cancelledAt?: string | null
+  cancelReason?: string | null
+  cancelActor?: string | null
+  failureClass?: string | null
   createdAt: string
   updatedAt: string
 }
@@ -145,7 +156,7 @@ export type TideWorkflow<TInput = unknown, TResult = unknown> = (
 ) => Promise<TResult> | TResult
 
 export type RecoveryWebhookPayload = {
-  type: 'run.resume'
+  type: 'run.resume' | 'run.invoke'
   runId: string
   workflowName: string
   reason: string
@@ -189,8 +200,57 @@ export type WebhookOptions = {
   secret?: string
 }
 
+export type EnqueueOptions = {
+  queue?: string
+  input?: unknown
+  metadata?: Record<string, unknown>
+  recoveryWebhook?: string
+  channels?: ChannelOptions[]
+  dedupeKey?: string
+  delayMs?: number
+  runAt?: string | Date
+  maxAttempts?: number
+  priority?: number
+  deadlineMs?: number
+}
+
+export type WorkOptions = {
+  queues?: string[]
+  leaseOwner?: string
+  pollMs?: number
+  limit?: number
+  signal?: AbortSignal
+  onError?: (error: unknown, run: TideRun) => void
+}
+
+export type QueueConfigOptions = {
+  concurrency?: number | null
+  ratePerMinute?: number | null
+  invokeUrl?: string | null
+}
+
+export type ScheduleOptions = {
+  cron: string
+  workflowName: string
+  input?: unknown
+  queue?: string
+  maxAttempts?: number
+  enabled?: boolean
+}
+
+/** The run was cancelled (by an operator, a deadline, or the API) while this
+ * worker held it. Workflows should let this propagate. */
+export class RunCancelledError extends Error {
+  constructor(readonly runId: string) {
+    super(`Run ${runId} was cancelled`)
+    this.name = 'RunCancelledError'
+  }
+}
+
 export class Tidebase {
   readonly runs: RunsClient
+  readonly queues: QueuesClient
+  readonly schedules: SchedulesClient
   private readonly url: string
   private readonly apiKey?: string
   private readonly webhookSecret?: string
@@ -203,6 +263,8 @@ export class Tidebase {
     this.apiKey = options.apiKey ?? process.env.TIDEBASE_API_KEY
     this.webhookSecret = options.webhookSecret ?? process.env.TIDEBASE_WEBHOOK_SECRET
     this.runs = new RunsClient(this)
+    this.queues = new QueuesClient(this)
+    this.schedules = new SchedulesClient(this)
   }
 
   workflow<TInput = unknown, TResult = unknown>(
@@ -226,7 +288,7 @@ export class Tidebase {
       }
 
       const payload = JSON.parse(body) as RecoveryWebhookPayload
-      if (payload.type !== 'run.resume') {
+      if (payload.type !== 'run.resume' && payload.type !== 'run.invoke') {
         return jsonResponse({ error: 'unsupported webhook type' }, 400)
       }
 
@@ -277,21 +339,102 @@ export class Tidebase {
       `/runs/${run.id}/begin`,
       { method: 'POST' }
     )
-    const context = new RunContext(this, run.id, begin.leaseOwner)
+    return this.execute(run.id, run.input as TInput, begin.leaseOwner, workflow)
+  }
 
+  /** Execute a workflow against a run whose lease this worker already holds. */
+  private async execute<TInput, TResult>(
+    runId: string,
+    input: TInput,
+    leaseOwner: string,
+    workflow: TideWorkflow<TInput, TResult>
+  ): Promise<TResult> {
+    const context = new RunContext(this, runId, leaseOwner)
     try {
-      const result = await workflow(context, run.input as TInput)
-      await this.request(`/runs/${run.id}/complete`, {
+      const result = await workflow(context, input)
+      await this.request(`/runs/${runId}/complete`, {
         method: 'POST',
         body: JSON.stringify({ result })
       })
       return result
     } catch (error) {
-      await this.request(`/runs/${run.id}/fail`, {
-        method: 'POST',
-        body: JSON.stringify({ error: serializeError(error) })
-      }).catch(() => undefined)
+      // A cancelled run is already terminal — reporting failure would be a
+      // lifecycle write after the authority has spoken (the server refuses
+      // it anyway). Anything else reports failure (and may requeue).
+      if (!(error instanceof RunCancelledError)) {
+        await this.request(`/runs/${runId}/fail`, {
+          method: 'POST',
+          body: JSON.stringify({ error: serializeError(error) })
+        }).catch(() => undefined)
+      }
       throw error
+    }
+  }
+
+  /** Enqueue a workflow as a durable queued run. Tidebase will hold it until
+   * a worker claims it (tide.work) or a push queue dispatches it. */
+  async enqueue(workflowName: string, options: EnqueueOptions = {}) {
+    const queue = options.queue ?? 'default'
+    return this.request<{ run: TideRun; deduplicated: boolean }>(
+      `/queues/${encodeURIComponent(queue)}/enqueue`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          workflowName,
+          input: options.input,
+          metadata: options.metadata,
+          recoveryWebhook: options.recoveryWebhook,
+          channels: options.channels,
+          dedupeKey: options.dedupeKey,
+          delayMs: options.delayMs,
+          runAt:
+            options.runAt instanceof Date ? options.runAt.toISOString() : options.runAt,
+          maxAttempts: options.maxAttempts,
+          priority: options.priority,
+          deadlineMs: options.deadlineMs
+        })
+      }
+    )
+  }
+
+  /** Pull-mode worker loop: claim ready runs from queues and execute their
+   * registered workflows (register with tide.workflow(name, fn)). Runs until
+   * the AbortSignal fires. */
+  async work(options: WorkOptions = {}): Promise<void> {
+    const queues = options.queues ?? ['default']
+    const pollMs = options.pollMs ?? 1000
+    while (!options.signal?.aborted) {
+      const claim = await this.request<{ runs: TideRun[]; leaseOwner: string }>(
+        '/queues/claim',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            queues,
+            leaseOwner: options.leaseOwner,
+            limit: options.limit ?? 1
+          })
+        }
+      )
+      for (const run of claim.runs) {
+        const workflow = this.workflows.get(run.workflowName)
+        if (!workflow) {
+          await this.request(`/runs/${run.id}/fail`, {
+            method: 'POST',
+            body: JSON.stringify({
+              error: { message: `no workflow registered for ${run.workflowName}` }
+            })
+          }).catch(() => undefined)
+          continue
+        }
+        try {
+          await this.execute(run.id, run.input, claim.leaseOwner, workflow)
+        } catch (error) {
+          options.onError?.(error, run)
+        }
+      }
+      if (claim.runs.length === 0) {
+        await sleep(pollMs)
+      }
     }
   }
 
@@ -305,7 +448,17 @@ export class Tidebase {
       }
     })
     if (!response.ok) {
-      throw new Error(`Tidebase request failed: ${response.status} ${await response.text()}`)
+      const text = await response.text()
+      try {
+        const parsed = JSON.parse(text) as { code?: string }
+        if (parsed.code === 'run_cancelled') {
+          const match = path.match(/^\/runs\/([^/]+)/)
+          throw new RunCancelledError(match?.[1] ?? 'unknown')
+        }
+      } catch (error) {
+        if (error instanceof RunCancelledError) throw error
+      }
+      throw new Error(`Tidebase request failed: ${response.status} ${text}`)
     }
     return (await response.json()) as T
   }
@@ -361,6 +514,16 @@ export class RunsClient {
     })
   }
 
+  /** Cancel a run. Authoritative and one-way: in-flight workers observe it at
+   * their next step or gate boundary; complete/fail cannot resurrect it. */
+  async cancel(runId: string, options: { reason?: string; actor?: string } = {}) {
+    const response = await this.client.request<{ run: TideRun }>(`/runs/${runId}/cancel`, {
+      method: 'POST',
+      body: JSON.stringify(options)
+    })
+    return response.run
+  }
+
   async *subscribe(runId: string): AsyncGenerator<TideEvent> {
     const EventSourceImpl = globalThis.EventSource
     if (!EventSourceImpl) {
@@ -395,6 +558,53 @@ export class RunsClient {
     } finally {
       source.close()
     }
+  }
+}
+
+export class QueuesClient {
+  constructor(private readonly client: Tidebase) {}
+
+  async configure(name: string, config: QueueConfigOptions) {
+    return this.client.request<{ config: unknown }>(
+      `/queues/${encodeURIComponent(name)}/config`,
+      { method: 'PUT', body: JSON.stringify(config) }
+    )
+  }
+
+  async list() {
+    return this.client.request<{
+      queues: Array<{
+        name: string
+        queued: number
+        running: number
+        failed: number
+        completed: number
+        cancelled: number
+        config: QueueConfigOptions | null
+      }>
+    }>('/queues')
+  }
+}
+
+export class SchedulesClient {
+  constructor(private readonly client: Tidebase) {}
+
+  async set(name: string, options: ScheduleOptions) {
+    return this.client.request<{ schedule: unknown }>(
+      `/schedules/${encodeURIComponent(name)}`,
+      { method: 'PUT', body: JSON.stringify(options) }
+    )
+  }
+
+  async list() {
+    return this.client.request<{ schedules: unknown[] }>('/schedules')
+  }
+
+  async delete(name: string) {
+    return this.client.request<{ deleted: string }>(
+      `/schedules/${encodeURIComponent(name)}`,
+      { method: 'DELETE' }
+    )
   }
 }
 
@@ -437,6 +647,7 @@ export class RunContext {
         | { action: 'return'; output: TResult }
         | { action: 'execute'; step: { id: string }; leaseOwner: string }
         | { action: 'locked'; step: { id: string; name: string } }
+        | { action: 'cancelled' }
         | {
             action: 'input_mismatch'
             step: { id: string; name: string }
@@ -456,6 +667,7 @@ export class RunContext {
 
     const begin = await beginStep()
     if (begin.action === 'return') return begin.output
+    if (begin.action === 'cancelled') throw new RunCancelledError(this.runId)
     if (begin.action === 'input_mismatch') {
       throw new Error(
         `Step ${name} input hash changed for this run. Expected ${begin.expectedInputHash}, got ${begin.actualInputHash}`
@@ -473,6 +685,7 @@ export class RunContext {
         // re-begin the step to acquire a fresh lease before reporting results.
         const again = await beginStep()
         if (again.action === 'return') return again.output
+        if (again.action === 'cancelled') throw new RunCancelledError(this.runId)
         if (again.action === 'locked') {
           throw new Error(`Step ${name} is currently leased by another worker`)
         }
@@ -543,9 +756,10 @@ export class RunContext {
         throw new Error(`Gate ${name} timed out`)
       }
       await sleep(options.pollMs ?? 1000)
-      const response = await this.client.request<{ gate: typeof gate }>(
+      const response = await this.client.request<{ gate: typeof gate; runStatus?: string }>(
         `/runs/${this.runId}/gates/${gate.id}`
       )
+      if (response.runStatus === 'cancelled') throw new RunCancelledError(this.runId)
       gate = response.gate
     }
 
