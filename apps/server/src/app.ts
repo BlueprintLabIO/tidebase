@@ -3,13 +3,10 @@ import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { streamSSE } from 'hono/streaming'
 import { z } from 'zod'
-import { pool, tx } from './db.js'
 import { appendEvent, listEvents, subscribe } from './events.js'
+import { defaultContext, type ServerContext } from './context.js'
 import { nextFire, parseCron } from './cron.js'
 
-const leaseMs = Number(process.env.TIDEBASE_LEASE_MS ?? 60_000)
-const webhookSecret = process.env.TIDEBASE_WEBHOOK_SECRET
-const publicUrl = (process.env.TIDEBASE_PUBLIC_URL ?? `http://localhost:${process.env.PORT ?? 7373}`).replace(/\/$/, '')
 
 function timingSafeEqualString(a: string, b: string) {
   const aBuf = Buffer.from(a)
@@ -175,8 +172,17 @@ export type CreateAppOptions = {
   apiKey?: string
 }
 
-export function createApp(options: CreateAppOptions = {}) {
-  const apiKey = options.apiKey ?? process.env.TIDEBASE_API_KEY
+// Back-compat shape: createApp()/createApp({ apiKey }) builds an env-derived
+// context over the shared default pool, preserving pre-context semantics
+// (an explicit apiKey wins; an undefined one falls back to TIDEBASE_API_KEY).
+function optionsContext(options: CreateAppOptions): ServerContext {
+  const ctx = defaultContext()
+  return options.apiKey === undefined ? ctx : { ...ctx, apiKey: options.apiKey }
+}
+
+export function createApp(ctxOrOptions: ServerContext | CreateAppOptions = {}) {
+  const ctx = 'pool' in ctxOrOptions ? ctxOrOptions : optionsContext(ctxOrOptions)
+  const apiKey = ctx.apiKey
   const app = new Hono()
   app.use('*', cors())
   app.onError((error, c) => {
@@ -208,7 +214,7 @@ export function createApp(options: CreateAppOptions = {}) {
   app.post('/runs/:workflowName', async (c) => {
     const workflowName = c.req.param('workflowName')
     const body = createRunSchema.parse(await c.req.json())
-    const result = await tx(async (client) => {
+    const result = await ctx.tx(async (client) => {
       const runResult = await client.query(
         `insert into runs (workflow_name, input_json, metadata_json, recovery_webhook)
          values ($1, $2, $3, $4)
@@ -248,7 +254,7 @@ export function createApp(options: CreateAppOptions = {}) {
   })
 
   app.get('/runs', async (c) => {
-    const result = await pool.query(
+    const result = await ctx.pool.query(
       'select * from runs order by created_at desc limit 100'
     )
     return c.json({ runs: result.rows.map(mapRun) })
@@ -262,7 +268,7 @@ export function createApp(options: CreateAppOptions = {}) {
   app.post('/runs/:runId/cancel', async (c) => {
     const runId = c.req.param('runId')
     const body = cancelRunSchema.parse(await c.req.json().catch(() => ({})))
-    const result = await tx(async (client) => {
+    const result = await ctx.tx(async (client) => {
       const existing = await client.query('select * from runs where id = $1 for update', [runId])
       const row = existing.rows[0]
       if (!row) return null
@@ -297,7 +303,7 @@ export function createApp(options: CreateAppOptions = {}) {
     if ('terminal' in result) {
       return c.json({ error: 'run already completed', run: result.run }, 409)
     }
-    await dispatchChannelDeliveries(result.deliveries)
+    await dispatchChannelDeliveries(ctx, result.deliveries)
     return c.json({ run: result.run })
   })
 
@@ -313,7 +319,7 @@ export function createApp(options: CreateAppOptions = {}) {
       : new Date(Date.now() + (body.delayMs ?? 0))
     const deadlineAt = body.deadlineMs ? new Date(Date.now() + body.deadlineMs) : null
     try {
-      const result = await tx(async (client) => {
+      const result = await ctx.tx(async (client) => {
         const inserted = await client.query(
           `insert into runs (workflow_name, input_json, metadata_json, recovery_webhook,
                              status, queue_name, dedupe_key, priority, run_at, max_attempts, deadline_at)
@@ -351,7 +357,7 @@ export function createApp(options: CreateAppOptions = {}) {
       return c.json({ run: result, deduplicated: false })
     } catch (error) {
       if ((error as { code?: string }).code === '23505' && body.dedupeKey) {
-        const existing = await pool.query(
+        const existing = await ctx.pool.query(
           `select * from runs
            where queue_name = $1 and dedupe_key = $2 and status in ('queued', 'running')
            limit 1`,
@@ -374,7 +380,7 @@ export function createApp(options: CreateAppOptions = {}) {
     const leaseOwner = body.leaseOwner ?? randomUUID()
     const limit = body.limit ?? 1
     const claimed: ReturnType<typeof mapRun>[] = []
-    await tx(async (client) => {
+    await ctx.tx(async (client) => {
       for (const queue of body.queues) {
         if (claimed.length >= limit) break
         // Serialize claims per queue so cap math can't race between claimers.
@@ -417,7 +423,7 @@ export function createApp(options: CreateAppOptions = {}) {
                  updated_at = now()
              where id = $1
              returning *`,
-            [row.id, leaseOwner, leaseMs]
+            [row.id, leaseOwner, ctx.leaseMs]
           )
           await appendEvent(client, row.id, 'run.claimed', { leaseOwner, queue })
           claimed.push(mapRun(update.rows[0]))
@@ -428,7 +434,7 @@ export function createApp(options: CreateAppOptions = {}) {
   })
 
   app.get('/queues', async (c) => {
-    const stats = await pool.query(
+    const stats = await ctx.pool.query(
       `select queue_name,
               count(*) filter (where status = 'queued')::int as queued,
               count(*) filter (where status = 'running')::int as running,
@@ -438,7 +444,7 @@ export function createApp(options: CreateAppOptions = {}) {
        from runs where queue_name is not null
        group by queue_name`
     )
-    const configs = await pool.query('select * from queue_configs')
+    const configs = await ctx.pool.query('select * from queue_configs')
     const configByName = new Map(configs.rows.map((row) => [row.name, row]))
     const queues = stats.rows.map((row) => ({
       name: row.queue_name,
@@ -468,7 +474,7 @@ export function createApp(options: CreateAppOptions = {}) {
   app.put('/queues/:queue/config', async (c) => {
     const queue = c.req.param('queue')
     const body = queueConfigSchema.parse(await c.req.json())
-    const result = await pool.query(
+    const result = await ctx.pool.query(
       `insert into queue_configs (name, concurrency, rate_per_minute, invoke_url)
        values ($1, $2, $3, $4)
        on conflict (name) do update set
@@ -488,7 +494,7 @@ export function createApp(options: CreateAppOptions = {}) {
     const body = scheduleSchema.parse(await c.req.json())
     parseCron(body.cron) // validate before persisting
     const next = nextFire(body.cron, new Date())
-    const result = await pool.query(
+    const result = await ctx.pool.query(
       `insert into schedules (name, cron, workflow_name, input_json, queue_name, max_attempts, enabled, next_run_at)
        values ($1, $2, $3, $4, $5, $6, $7, $8)
        on conflict (name) do update set
@@ -510,12 +516,12 @@ export function createApp(options: CreateAppOptions = {}) {
   })
 
   app.get('/schedules', async (c) => {
-    const result = await pool.query('select * from schedules order by name asc')
+    const result = await ctx.pool.query('select * from schedules order by name asc')
     return c.json({ schedules: result.rows.map(mapSchedule) })
   })
 
   app.delete('/schedules/:name', async (c) => {
-    const result = await pool.query('delete from schedules where name = $1 returning name', [
+    const result = await ctx.pool.query('delete from schedules where name = $1 returning name', [
       c.req.param('name')
     ])
     if (!result.rows[0]) return c.json({ error: 'schedule not found' }, 404)
@@ -525,13 +531,13 @@ export function createApp(options: CreateAppOptions = {}) {
   app.get('/runs/:runId', async (c) => {
     const runId = c.req.param('runId')
     const [runResult, stepsResult, stateResult, streamsResult, versionsResult, edgeResult, childRunsResult, recoveryResult, channelsResult, deliveriesResult, gatesResult, usageResult, events] = await Promise.all([
-      pool.query('select * from runs where id = $1', [runId]),
-      pool.query('select * from steps where run_id = $1 order by created_at asc', [
+      ctx.pool.query('select * from runs where id = $1', [runId]),
+      ctx.pool.query('select * from steps where run_id = $1 order by created_at asc', [
         runId
       ]),
-      pool.query('select * from run_state where run_id = $1', [runId]),
-      pool.query('select * from state_streams where run_id = $1 order by created_at asc', [runId]),
-      pool.query(
+      ctx.pool.query('select * from run_state where run_id = $1', [runId]),
+      ctx.pool.query('select * from state_streams where run_id = $1 order by created_at asc', [runId]),
+      ctx.pool.query(
         `select v.*
          from state_versions v
          join state_streams s on s.id = v.stream_id
@@ -539,8 +545,8 @@ export function createApp(options: CreateAppOptions = {}) {
          order by s.name asc, v.version asc`,
         [runId]
       ),
-      pool.query('select * from run_edges where parent_run_id = $1 order by created_at asc', [runId]),
-      pool.query(
+      ctx.pool.query('select * from run_edges where parent_run_id = $1 order by created_at asc', [runId]),
+      ctx.pool.query(
         `select r.*
          from runs r
          join run_edges e on e.child_run_id = r.id
@@ -548,18 +554,18 @@ export function createApp(options: CreateAppOptions = {}) {
          order by e.created_at asc`,
         [runId]
       ),
-      pool.query(
+      ctx.pool.query(
         'select * from recovery_attempts where run_id = $1 order by created_at desc',
         [runId]
       ),
-      pool.query('select * from channels where run_id = $1 order by created_at asc', [runId]),
-      pool.query(
+      ctx.pool.query('select * from channels where run_id = $1 order by created_at asc', [runId]),
+      ctx.pool.query(
         'select * from channel_deliveries where run_id = $1 order by created_at desc limit 100',
         [runId]
       ),
-      pool.query('select * from gates where run_id = $1 order by created_at asc', [runId]),
-      pool.query('select * from usage_records where run_id = $1 order by created_at asc', [runId]),
-      listEvents(runId)
+      ctx.pool.query('select * from gates where run_id = $1 order by created_at asc', [runId]),
+      ctx.pool.query('select * from usage_records where run_id = $1 order by created_at asc', [runId]),
+      listEvents(runId, 0, ctx.pool)
     ])
     if (!runResult.rows[0]) return c.json({ error: 'run not found' }, 404)
     return c.json({
@@ -582,7 +588,7 @@ export function createApp(options: CreateAppOptions = {}) {
   app.post('/runs/:runId/children', async (c) => {
     const parentRunId = c.req.param('runId')
     const body = createChildRunSchema.parse(await c.req.json())
-    const result = await tx(async (client) => {
+    const result = await ctx.tx(async (client) => {
       const parent = await client.query('select * from runs where id = $1 for update', [parentRunId])
       if (!parent.rows[0]) return null
 
@@ -674,7 +680,7 @@ export function createApp(options: CreateAppOptions = {}) {
   app.post('/runs/:runId/begin', async (c) => {
     const runId = c.req.param('runId')
     const leaseOwner = c.req.header('x-tidebase-worker') ?? randomUUID()
-    const run = await tx(async (client) => {
+    const run = await ctx.tx(async (client) => {
       const result = await client.query(
         `select * from runs where id = $1 for update`,
         [runId]
@@ -700,7 +706,7 @@ export function createApp(options: CreateAppOptions = {}) {
              updated_at = now()
          where id = $1
          returning *`,
-        [runId, leaseOwner, leaseMs]
+        [runId, leaseOwner, ctx.leaseMs]
       )
       await appendEvent(client, runId, 'run.started', { leaseOwner })
       return mapRun(update.rows[0])
@@ -721,14 +727,14 @@ export function createApp(options: CreateAppOptions = {}) {
     // Extend-only renewal: no attempt bump, no run.started event. A worker
     // that lost its lease (reconciler reclaim, takeover, cancellation) must
     // not be able to resurrect it here — it learns it is a zombie instead.
-    const result = await tx(async (client) => {
+    const result = await ctx.tx(async (client) => {
       const update = await client.query(
         `update runs
          set lease_expires_at = now() + ($3 || ' milliseconds')::interval,
              updated_at = now()
          where id = $1 and status = 'running' and lease_owner = $2
          returning *`,
-        [runId, leaseOwner, leaseMs]
+        [runId, leaseOwner, ctx.leaseMs]
       )
       if (update.rows[0]) return { run: mapRun(update.rows[0]) }
       const existing = await client.query('select * from runs where id = $1', [runId])
@@ -746,7 +752,7 @@ export function createApp(options: CreateAppOptions = {}) {
   app.post('/runs/:runId/complete', async (c) => {
     const runId = c.req.param('runId')
     const body = await c.req.json()
-    const result = await tx(async (client) => {
+    const result = await ctx.tx(async (client) => {
       // Cancellation is one-way: a worker finishing after cancel cannot
       // resurrect the run.
       const update = await client.query(
@@ -776,14 +782,14 @@ export function createApp(options: CreateAppOptions = {}) {
       return { run: mapRun(update.rows[0]), deliveries }
     })
     if (!result) return c.json({ error: 'run not found' }, 404)
-    await dispatchChannelDeliveries(result.deliveries)
+    await dispatchChannelDeliveries(ctx, result.deliveries)
     return c.json({ run: result.run })
   })
 
   app.post('/runs/:runId/fail', async (c) => {
     const runId = c.req.param('runId')
     const body = await c.req.json()
-    const result = await tx(async (client) => {
+    const result = await ctx.tx(async (client) => {
       const existing = await client.query('select * from runs where id = $1 for update', [runId])
       const row = existing.rows[0]
       if (!row) return null
@@ -840,15 +846,15 @@ export function createApp(options: CreateAppOptions = {}) {
       return { run: mapRun(update.rows[0]), deliveries, requeued: false, skipRecovery: false }
     })
     if (!result) return c.json({ error: 'run not found' }, 404)
-    await dispatchChannelDeliveries(result.deliveries)
-    if (!result.skipRecovery) await dispatchRecovery(result.run, 'run_failed')
+    await dispatchChannelDeliveries(ctx, result.deliveries)
+    if (!result.skipRecovery) await dispatchRecovery(ctx, result.run, 'run_failed')
     return c.json({ run: result.run, requeued: result.requeued })
   })
 
   app.post('/runs/:runId/gates/begin', async (c) => {
     const runId = c.req.param('runId')
     const body = gateBeginSchema.parse(await c.req.json())
-    const result = await tx(async (client) => {
+    const result = await ctx.tx(async (client) => {
       const runRow = await client.query('select status from runs where id = $1', [runId])
       if (runRow.rows[0]?.status === 'cancelled') {
         return { cancelled: true as const }
@@ -882,13 +888,13 @@ export function createApp(options: CreateAppOptions = {}) {
       )
       const gate = mapGate(inserted.rows[0])
       await appendEvent(client, runId, 'gate.created', {
-        gate: publicGate(gate)
+        gate: publicGate(gate, ctx.publicUrl)
       })
       const deliveries = await queueChannelDeliveries(
         client,
         runId,
         'gate.created',
-        { gate: publicGate(gate) },
+        { gate: publicGate(gate, ctx.publicUrl) },
         body.channels ?? [],
         gate.id
       )
@@ -897,12 +903,12 @@ export function createApp(options: CreateAppOptions = {}) {
     if ('cancelled' in result) {
       return c.json({ error: 'run is cancelled', code: 'run_cancelled' }, 409)
     }
-    await dispatchChannelDeliveries(result.deliveries)
+    await dispatchChannelDeliveries(ctx, result.deliveries)
     return c.json({ action: result.gate.status === 'pending' ? 'wait' : 'return', gate: result.gate })
   })
 
   app.get('/runs/:runId/gates/:gateId', async (c) => {
-    const result = await pool.query(
+    const result = await ctx.pool.query(
       `select g.*, r.status as run_status
        from gates g join runs r on r.id = g.run_id
        where g.run_id = $1 and g.id = $2`,
@@ -916,7 +922,7 @@ export function createApp(options: CreateAppOptions = {}) {
     const runId = c.req.param('runId')
     const gateId = c.req.param('gateId')
     const body = gateResolveSchema.parse(await c.req.json())
-    const gate = await tx(async (client) => {
+    const gate = await ctx.tx(async (client) => {
       const update = await client.query(
         `update gates
          set status = $4,
@@ -939,30 +945,30 @@ export function createApp(options: CreateAppOptions = {}) {
       if (!update.rows[0]) return null
       const resolved = mapGate(update.rows[0])
       await appendEvent(client, runId, 'gate.resolved', {
-        gate: publicGate(resolved)
+        gate: publicGate(resolved, ctx.publicUrl)
       })
       const deliveries = await queueChannelDeliveries(
         client,
         runId,
         'gate.resolved',
-        { gate: publicGate(resolved) },
+        { gate: publicGate(resolved, ctx.publicUrl) },
         resolved.channels,
         gateId
       )
       return { gate: resolved, deliveries }
     })
     if (!gate) return c.json({ error: 'gate not found, already resolved, or invalid token' }, 409)
-    await dispatchChannelDeliveries(gate.deliveries)
+    await dispatchChannelDeliveries(ctx, gate.deliveries)
     return c.json({ gate: gate.gate })
   })
 
   app.post('/runs/:runId/recover', async (c) => {
     const runId = c.req.param('runId')
     const body = await c.req.json().catch(() => ({}))
-    const result = await pool.query('select * from runs where id = $1', [runId])
+    const result = await ctx.pool.query('select * from runs where id = $1', [runId])
     const row = result.rows[0]
     if (!row) return c.json({ error: 'run not found' }, 404)
-    const attempt = await dispatchRecovery(mapRun(row), body.reason ?? 'manual')
+    const attempt = await dispatchRecovery(ctx, mapRun(row), body.reason ?? 'manual')
     if (!attempt) {
       return c.json({ error: 'run has no recoveryWebhook configured' }, 422)
     }
@@ -974,7 +980,7 @@ export function createApp(options: CreateAppOptions = {}) {
     const body = beginStepSchema.parse(await c.req.json())
     const leaseOwner = body.leaseOwner ?? randomUUID()
 
-    const result = await tx(async (client) => {
+    const result = await ctx.tx(async (client) => {
       // Cancellation is enforced at step boundaries: an in-flight worker
       // discovers it here and unwinds instead of starting new work.
       const runRow = await client.query('select status from runs where id = $1', [runId])
@@ -1037,7 +1043,7 @@ export function createApp(options: CreateAppOptions = {}) {
           json(body.input ?? {}),
           json(body.options ?? {}),
           leaseOwner,
-          leaseMs
+          ctx.leaseMs
         ]
       )
       await appendEvent(client, runId, 'step.started', {
@@ -1056,7 +1062,7 @@ export function createApp(options: CreateAppOptions = {}) {
     const runId = c.req.param('runId')
     const stepId = c.req.param('stepId')
     const body = completeStepSchema.parse(await c.req.json())
-    const result = await tx(async (client) => {
+    const result = await ctx.tx(async (client) => {
       const update = await client.query(
         `update steps
          set status = 'completed',
@@ -1087,7 +1093,7 @@ export function createApp(options: CreateAppOptions = {}) {
     const runId = c.req.param('runId')
     const stepId = c.req.param('stepId')
     const body = failStepSchema.parse(await c.req.json())
-    const result = await tx(async (client) => {
+    const result = await ctx.tx(async (client) => {
       const existing = await client.query(
         `select options_json from steps where id = $1 and run_id = $2`,
         [stepId, runId]
@@ -1129,14 +1135,14 @@ export function createApp(options: CreateAppOptions = {}) {
       return { step: mapStep(update.rows[0]), deliveries }
     })
     if (!result) return c.json({ error: 'step not found or lease lost' }, 409)
-    await dispatchChannelDeliveries(result.deliveries)
+    await dispatchChannelDeliveries(ctx, result.deliveries)
     return c.json({ step: result.step })
   })
 
   app.put('/runs/:runId/state', async (c) => {
     const runId = c.req.param('runId')
     const body = stateSchema.parse(await c.req.json())
-    const state = await tx(async (client) => {
+    const state = await ctx.tx(async (client) => {
       const result = await client.query(
         `insert into run_state (run_id, value_json, version, updated_at)
          values ($1, $2, 1, now())
@@ -1169,14 +1175,14 @@ export function createApp(options: CreateAppOptions = {}) {
       })
       return { state: mapState(result.rows[0]), deliveries }
     })
-    await dispatchChannelDeliveries(state.deliveries)
+    await dispatchChannelDeliveries(ctx, state.deliveries)
     return c.json({ state: state.state })
   })
 
   app.patch('/runs/:runId/state', async (c) => {
     const runId = c.req.param('runId')
     const body = stateSchema.parse(await c.req.json())
-    const state = await tx(async (client) => {
+    const state = await ctx.tx(async (client) => {
       const result = await client.query(
         `insert into run_state (run_id, value_json, version, updated_at)
          values ($1, $2, 1, now())
@@ -1210,14 +1216,14 @@ export function createApp(options: CreateAppOptions = {}) {
       })
       return { state: mapState(result.rows[0]), deliveries }
     })
-    await dispatchChannelDeliveries(state.deliveries)
+    await dispatchChannelDeliveries(ctx, state.deliveries)
     return c.json({ state: state.state })
   })
 
   app.post('/runs/:runId/state/save', async (c) => {
     const runId = c.req.param('runId')
     const body = stateSaveSchema.parse(await c.req.json())
-    const version = await tx(async (client) => {
+    const version = await ctx.tx(async (client) => {
       const streamName = body.stream ?? 'run'
       const current =
         streamName === 'run'
@@ -1259,7 +1265,7 @@ export function createApp(options: CreateAppOptions = {}) {
     const runId = c.req.param('runId')
     const stream = c.req.query('stream')
     const labeled = c.req.query('labeled') === 'true'
-    const result = await pool.query(
+    const result = await ctx.pool.query(
       `select v.*
        from state_versions v
        join state_streams s on s.id = v.stream_id
@@ -1276,7 +1282,7 @@ export function createApp(options: CreateAppOptions = {}) {
     const runId = c.req.param('runId')
     const body = snapshotSchema.parse(await c.req.json())
     const target = body.target ?? { type: 'run', id: runId }
-    const version = await tx(async (client) => {
+    const version = await ctx.tx(async (client) => {
       const saved = await recordStateVersion(client, runId, {
         streamName: `${target.type}:${target.id}`,
         targetType: target.type,
@@ -1299,7 +1305,7 @@ export function createApp(options: CreateAppOptions = {}) {
 
   app.get('/runs/:runId/snapshots', async (c) => {
     const runId = c.req.param('runId')
-    const result = await pool.query(
+    const result = await ctx.pool.query(
       `select v.*
        from state_versions v
        join state_streams s on s.id = v.stream_id
@@ -1313,7 +1319,7 @@ export function createApp(options: CreateAppOptions = {}) {
   app.post('/runs/:runId/usage', async (c) => {
     const runId = c.req.param('runId')
     const body = usageSchema.parse(await c.req.json())
-    const usage = await tx(async (client) => {
+    const usage = await ctx.tx(async (client) => {
       const result = await client.query(
         `insert into usage_records
           (run_id, step_id, kind, provider, model, label, quantity, unit, input_tokens, output_tokens, total_tokens, cost_usd, metadata_json)
@@ -1343,7 +1349,7 @@ export function createApp(options: CreateAppOptions = {}) {
       })
       return { usage: record, deliveries }
     })
-    await dispatchChannelDeliveries(usage.deliveries)
+    await dispatchChannelDeliveries(ctx, usage.deliveries)
     return c.json({ usage: usage.usage })
   })
 
@@ -1351,7 +1357,7 @@ export function createApp(options: CreateAppOptions = {}) {
     const runId = c.req.param('runId')
     const after = Number(c.req.query('after') ?? 0)
     return streamSSE(c, async (stream) => {
-      for (const event of await listEvents(runId, after)) {
+      for (const event of await listEvents(runId, after, ctx.pool)) {
         await stream.writeSSE({
           id: String(event.seq),
           data: JSON.stringify(event)
@@ -1376,6 +1382,7 @@ export function createApp(options: CreateAppOptions = {}) {
 }
 
 export async function dispatchRecovery(
+  ctx: ServerContext,
   run: ReturnType<typeof mapRun>,
   reason: string,
   payloadType: 'run.resume' | 'run.invoke' = 'run.resume',
@@ -1391,11 +1398,11 @@ export async function dispatchRecovery(
     attempt: run.attempt
   }
   const body = JSON.stringify(payload)
-  const signature = webhookSecret
-    ? createHmac('sha256', webhookSecret).update(body).digest('hex')
+  const signature = ctx.webhookSecret
+    ? createHmac('sha256', ctx.webhookSecret).update(body).digest('hex')
     : undefined
 
-  const created = await tx(async (client) => {
+  const created = await ctx.tx(async (client) => {
     const result = await client.query(
       `insert into recovery_attempts (run_id, reason, webhook_url, status)
        values ($1, $2, $3, 'pending')
@@ -1420,7 +1427,7 @@ export async function dispatchRecovery(
       body
     })
     const responseBody = await response.text()
-    return await tx(async (client) => {
+    return await ctx.tx(async (client) => {
       const result = await client.query(
         `update recovery_attempts
          set status = $2,
@@ -1443,7 +1450,7 @@ export async function dispatchRecovery(
       return mapRecoveryAttempt(result.rows[0])
     })
   } catch (error) {
-    return await tx(async (client) => {
+    return await ctx.tx(async (client) => {
       const result = await client.query(
         `update recovery_attempts
          set status = 'failed',
@@ -1632,7 +1639,7 @@ async function queueChannelDeliveries(
   return queued
 }
 
-async function dispatchChannelDeliveries(deliveries: QueuedChannelDelivery[]) {
+async function dispatchChannelDeliveries(ctx: ServerContext, deliveries: QueuedChannelDelivery[]) {
   for (const delivery of deliveries) {
     try {
       const body = JSON.stringify({
@@ -1654,7 +1661,7 @@ async function dispatchChannelDeliveries(deliveries: QueuedChannelDelivery[]) {
         body
       })
       const responseBody = await response.text()
-      await pool.query(
+      await ctx.pool.query(
         `update channel_deliveries
          set status = $2,
              http_status = $3,
@@ -1664,7 +1671,7 @@ async function dispatchChannelDeliveries(deliveries: QueuedChannelDelivery[]) {
         [delivery.deliveryId, response.ok ? 'delivered' : 'failed', response.status, responseBody.slice(0, 8000)]
       )
     } catch (error) {
-      await pool.query(
+      await ctx.pool.query(
         `update channel_deliveries
          set status = 'failed',
              error_text = $2,
@@ -1696,7 +1703,7 @@ function channelMatchesEvent(
   return channel.events.length === 0 || channel.events.includes(eventType)
 }
 
-function publicGate(gate: ReturnType<typeof mapGate>) {
+function publicGate(gate: ReturnType<typeof mapGate>, publicUrl: string) {
   return {
     id: gate.id,
     runId: gate.runId,

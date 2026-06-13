@@ -50,6 +50,7 @@ The SDK unit tests (`packages/sdk/test`) need no infrastructure.
 | Push-mode dispatch records signed run.invoke deliveries win-or-lose and never double-dispatches within the redelivery horizon | At-least-once with a bounded duplicate window | `schedules.test.ts` |
 | Deadlines cancel overdue runs with reason `deadline` via the reconciler | Timeouts are durable and externally visible | `cancellation.test.ts` |
 | The SDK work loop executes registered workflows off claimed runs, and a gate-blocked worker unwinds with RunCancelledError on cancel | The client honors the same lifecycle the server enforces | `e2e-queues.test.ts` |
+| Many embedded contexts coexist in one process: runs are invisible across contexts, API keys apply per context, and a reconciler tick acts only on its own context's database | The embedding contract multi-tenant hosting is built on — one database per tenant, zero shared state | `embed.test.ts` |
 
 ## Conventions
 

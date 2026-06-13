@@ -4,3 +4,4 @@ build
 .svelte-kit
 .env
 .DS_Store
+apps/server/migrations/
