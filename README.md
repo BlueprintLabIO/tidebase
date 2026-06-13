@@ -167,7 +167,7 @@ See [docs/production.md](docs/production.md) for the full lifecycle, replay cont
 pnpm test
 ```
 
-The suite (84 TypeScript tests + 9 Python integration tests, run in CI on every push) uses the same Postgres in an isolated `tidebase_test` database. It is invariant-driven rather than coverage-driven: every test asserts a durability or safety guarantee through the public API or SDK, against real Postgres, including concurrency probes for the guarantees that only matter under contention.
+The suite (93 TypeScript tests — 85 server + 8 SDK — and 12 Python integration tests, run in CI on every push) uses the same Postgres in an isolated `tidebase_test` database. It is invariant-driven rather than coverage-driven: every test asserts a durability or safety guarantee through the public API or SDK, against real Postgres, including concurrency probes for the guarantees that only matter under contention.
 
 What it proves:
 
