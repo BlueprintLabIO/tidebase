@@ -13,6 +13,7 @@ import { pool, tx } from './db.js'
 import { appendEvent } from './events.js'
 import { dispatchRecovery, mapRun, retryBackoffMs } from './app.js'
 import { nextFire } from './cron.js'
+import { sweepAbuseStores } from './ratelimit.js'
 
 const TICK_LOCK = 0x74646202 // 'tdb' 02
 const tickMs = Number(process.env.TIDEBASE_RECONCILE_MS ?? 5_000)
@@ -24,6 +25,7 @@ export type TickReport = {
   cancelledByDeadline: number
   scheduled: number
   invoked: number
+  grantsExpired: number
 }
 
 export async function reconcileTick(now = new Date()): Promise<TickReport | null> {
@@ -34,7 +36,8 @@ export async function reconcileTick(now = new Date()): Promise<TickReport | null
     recovered: 0,
     cancelledByDeadline: 0,
     scheduled: 0,
-    invoked: 0
+    invoked: 0,
+    grantsExpired: 0
   }
   try {
     const lock = await lockClient.query('select pg_try_advisory_lock($1) as ok', [TICK_LOCK])
@@ -44,10 +47,51 @@ export async function reconcileTick(now = new Date()): Promise<TickReport | null
     await sweepDeadlines(report, now)
     await sweepSchedules(report, now)
     await sweepPushQueues(report, now)
+    await sweepExpiredGrants(report, now)
+    await sweepAbuseStores(now)
     return report
   } finally {
     await lockClient.query('select pg_advisory_unlock($1)', [TICK_LOCK]).catch(() => undefined)
     lockClient.release()
+  }
+}
+
+async function sweepExpiredGrants(report: TickReport, now: Date) {
+  // Grants past their deadline (active lifetime OR pending-approval window) are
+  // transitioned to 'expired' and a grant.expired receipt is appended. Without
+  // this, expired grants linger in non-terminal states and pending approvals
+  // never time out. The `use` path already rejects expired grants inline; this
+  // makes the terminal state and audit trail authoritative.
+  const expired = await pool.query(
+    `select id, run_id, agent_id, resource, action, mode, gate_id, expires_at
+     from grants
+     where status in ('pending','approved','active')
+       and expires_at is not null and expires_at < $1
+     order by expires_at
+     limit 200`,
+    [now]
+  )
+  for (const row of expired.rows) {
+    await tx(async (client) => {
+      const update = await client.query(
+        `update grants set status = 'expired', updated_at = now()
+         where id = $1 and status in ('pending','approved','active') and expires_at < $2
+         returning id`,
+        [row.id, now]
+      )
+      if (!update.rows[0]) return
+      await appendEvent(client, row.run_id, 'grant.expired', {
+        grantId: row.id,
+        resource: row.resource,
+        action: row.action,
+        agentId: row.agent_id ?? null,
+        mode: row.mode,
+        status: 'expired',
+        gateId: row.gate_id ?? null,
+        expiresAt: row.expires_at?.toISOString?.() ?? null
+      })
+      report.grantsExpired += 1
+    })
   }
 }
 
