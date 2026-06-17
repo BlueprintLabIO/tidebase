@@ -1,8 +1,10 @@
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
+import { AgentsClient, AuditClient, ResourcesClient, RunAuth } from './auth.js'
 
 export type TidebaseOptions = {
   url?: string
   apiKey?: string
+  agentSessionToken?: string
   webhookSecret?: string
 }
 
@@ -271,8 +273,12 @@ export class Tidebase {
   readonly runs: RunsClient
   readonly queues: QueuesClient
   readonly schedules: SchedulesClient
+  readonly agents: AgentsClient
+  readonly resources: ResourcesClient
+  readonly audit: AuditClient
   private readonly url: string
   private readonly apiKey?: string
+  private readonly agentSessionToken?: string
   private readonly webhookSecret?: string
   private readonly workflows = new Map<string, TideWorkflow>()
 
@@ -281,10 +287,14 @@ export class Tidebase {
       options.url ?? process.env.TIDEBASE_URL ?? 'http://localhost:7373'
     )
     this.apiKey = options.apiKey ?? process.env.TIDEBASE_API_KEY
+    this.agentSessionToken = options.agentSessionToken ?? process.env.TIDEBASE_AGENT_SESSION_TOKEN
     this.webhookSecret = options.webhookSecret ?? process.env.TIDEBASE_WEBHOOK_SECRET
     this.runs = new RunsClient(this)
     this.queues = new QueuesClient(this)
     this.schedules = new SchedulesClient(this)
+    this.agents = new AgentsClient(this)
+    this.resources = new ResourcesClient(this)
+    this.audit = new AuditClient(this)
   }
 
   workflow<TInput = unknown, TResult = unknown>(
@@ -328,6 +338,11 @@ export class Tidebase {
         reason: payload.reason
       })
     }
+  }
+
+  /** Build a run-scoped authorization client outside a workflow callback. */
+  auth(runId: string) {
+    return new RunAuth(this, runId)
   }
 
   async run<TInput = unknown, TResult = unknown>(
@@ -463,7 +478,11 @@ export class Tidebase {
       ...init,
       headers: {
         'content-type': 'application/json',
-        ...(this.apiKey ? { authorization: `Bearer ${this.apiKey}` } : {}),
+        ...(this.agentSessionToken
+          ? { authorization: `Bearer ${this.agentSessionToken}` }
+          : this.apiKey
+            ? { authorization: `Bearer ${this.apiKey}` }
+            : {}),
         ...init.headers
       }
     })
@@ -665,6 +684,7 @@ export class RunContext {
   readonly usage: RunUsage
   readonly snapshots: RunSnapshots
   readonly gates: RunGates
+  readonly auth: RunAuth
 
   constructor(
     protected readonly client: Tidebase,
@@ -675,6 +695,7 @@ export class RunContext {
     this.usage = new RunUsage(client, runId)
     this.snapshots = new RunSnapshots(client, runId)
     this.gates = new RunGates(client, runId)
+    this.auth = new RunAuth(client, runId)
   }
 
   async step<TResult>(

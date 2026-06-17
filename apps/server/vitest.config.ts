@@ -12,7 +12,12 @@ export default defineConfig({
     hookTimeout: 20_000,
     env: {
       DATABASE_URL: testDatabaseUrl,
-      TIDEBASE_WEBHOOK_SECRET: 'test-webhook-secret'
+      TIDEBASE_WEBHOOK_SECRET: 'test-webhook-secret',
+      // The PG-backed limiter is shared across all test workers (same DB); keep
+      // the per-window ceiling high so legitimate test bursts never trip it. The
+      // limiter logic itself is covered deterministically in ratelimit.test.ts.
+      TIDEBASE_PROVE_RATE: '100000',
+      TIDEBASE_GRANT_RATE: '100000'
     }
   }
 })

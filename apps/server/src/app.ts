@@ -1,15 +1,95 @@
-import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
+import {
+  createHash,
+  createHmac,
+  createPublicKey,
+  randomBytes,
+  randomUUID,
+  timingSafeEqual,
+  verify as cryptoVerify
+} from 'node:crypto'
 import { Hono } from 'hono'
+import { bodyLimit } from 'hono/body-limit'
 import { cors } from 'hono/cors'
 import { streamSSE } from 'hono/streaming'
 import { z } from 'zod'
 import { pool, tx } from './db.js'
 import { appendEvent, listEvents, subscribe } from './events.js'
 import { nextFire, parseCron } from './cron.js'
+import { callMatchesAction, evaluatePolicy } from './policy.js'
+import { acquireCredential, executeProxy, normalizeCredential, resolveBackend } from './providers.js'
+import { encryptSecret, resolveKms } from './envelope.js'
+import { consumeChallengePg, rateLimitPg } from './ratelimit.js'
 
 const leaseMs = Number(process.env.TIDEBASE_LEASE_MS ?? 60_000)
 const webhookSecret = process.env.TIDEBASE_WEBHOOK_SECRET
 const publicUrl = (process.env.TIDEBASE_PUBLIC_URL ?? `http://localhost:${process.env.PORT ?? 7373}`).replace(/\/$/, '')
+
+// --- Agent-auth control-plane configuration ---------------------------------
+// The credential broker is security-critical. Unlike the durability core (which
+// stays open without a key for backward compat), broker routes MUST authenticate
+// and fail closed: no API key configured => broker endpoints return 503.
+const isProduction = (process.env.NODE_ENV ?? process.env.TIDEBASE_ENV) === 'production'
+// dev_token identity lets an admin-key holder mint a session without the agent
+// proving anything cryptographically. Allowed in dev; disabled in production
+// unless explicitly opted in.
+const allowDevToken = process.env.TIDEBASE_ALLOW_DEV_TOKEN === '1' || !isProduction
+// How long a pending approval stays open before the reconciler expires it.
+const approvalWindowMs = Number(process.env.TIDEBASE_GRANT_APPROVAL_TTL_S ?? 3600) * 1000
+
+function clientIp(c: { req: { header: (name: string) => string | undefined } }): string {
+  const fwd = c.req.header('x-forwarded-for')
+  if (fwd) return fwd.split(',')[0]!.trim()
+  return c.req.header('x-real-ip') ?? 'local'
+}
+
+/** Routes that broker credentials. Always authenticated; fail closed without a key. */
+function isBrokerPath(path: string) {
+  return (
+    path === '/agents' ||
+    path.startsWith('/agents/') ||
+    path === '/resources' ||
+    path.startsWith('/resources/') ||
+    path === '/audit' ||
+    /^\/runs\/[^/]+\/grants(?:\/|$)/.test(path)
+  )
+}
+
+/** Stateless, single-use, 60s keypair challenge: base64url(payload).hmac(payload). */
+function mintChallenge(agentId: string, secret: string) {
+  const exp = Date.now() + 60_000
+  const nonce = randomBytes(16).toString('base64url')
+  const payload = Buffer.from(JSON.stringify({ agentId, exp, nonce })).toString('base64url')
+  const sig = createHmac('sha256', secret).update(payload).digest('base64url')
+  return { challenge: `${payload}.${sig}`, expiresAt: new Date(exp).toISOString() }
+}
+
+function verifyChallenge(agentId: string, challenge: string, secret: string): boolean {
+  const dot = challenge.indexOf('.')
+  if (dot <= 0) return false
+  const payload = challenge.slice(0, dot)
+  const sig = challenge.slice(dot + 1)
+  const expected = createHmac('sha256', secret).update(payload).digest('base64url')
+  if (!timingSafeEqualString(sig, expected)) return false
+  let data: { agentId?: unknown; exp?: unknown }
+  try {
+    data = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'))
+  } catch {
+    return false
+  }
+  return data.agentId === agentId && typeof data.exp === 'number' && data.exp > Date.now()
+}
+
+/** Verify an Ed25519 signature over the challenge with the agent's registered key. */
+function verifyKeypairProof(publicKeyPem: string, challenge: string, signatureB64: string): boolean {
+  try {
+    const key = createPublicKey(publicKeyPem)
+    const sig = Buffer.from(signatureB64, 'base64')
+    if (sig.length === 0) return false
+    return cryptoVerify(null, Buffer.from(challenge), key, sig)
+  } catch {
+    return false
+  }
+}
 
 function timingSafeEqualString(a: string, b: string) {
   const aBuf = Buffer.from(a)
@@ -126,6 +206,53 @@ const gateResolveSchema = z.object({
   payload: z.unknown().optional()
 })
 
+const agentRegisterSchema = z.object({
+  name: z.string().min(1),
+  principal: z.string().min(1).optional(),
+  identityKind: z.enum(['dev_token', 'keypair', 'cloud_key', 'spire']).optional(),
+  publicKey: z.string().optional(),
+  metadata: jsonRecord.optional()
+})
+
+const agentProveSchema = z.object({
+  token: z.string().optional(),
+  signature: z.string().optional(),
+  challenge: z.string().optional()
+})
+
+const resourceConnectSchema = z.object({
+  name: z.string().min(1),
+  provider: z.enum(['nango', 'openbao', 'static']).optional(),
+  principal: z.string().min(1).optional(),
+  scopesAllowed: z.array(z.string().min(1)).optional(),
+  // Upstream API base the proxy is pinned to (SSRF defense). Required to proxy.
+  baseUrl: z.string().url().optional(),
+  // When set, proxied paths must start with this prefix (narrows grant scope).
+  allowedPathPrefix: z.string().min(1).optional(),
+  // For provider 'static': the credential to vault (envelope-encrypted at rest).
+  // Either a bearer-token string or {scheme,...}. Never logged or returned.
+  secret: z.union([z.string().min(1), jsonRecord]).optional(),
+  // For nango/openbao: opaque pointer to the held secret (connectionId / vault path).
+  connectionRef: z.string().min(1).optional(),
+  metadata: jsonRecord.optional()
+})
+
+const grantRequestSchema = z.object({
+  resource: z.string().min(1),
+  action: z.string().min(1),
+  reason: z.string().optional(),
+  scopes: z.array(z.string().min(1)).optional(),
+  mode: z.enum(['proxy', 'mint']).optional(),
+  ttlSeconds: z.number().int().positive().max(3600).optional(),
+  maxUses: z.number().int().positive().max(100).optional()
+})
+
+const grantUseSchema = z.object({
+  method: z.string().min(1),
+  path: z.string().min(1),
+  body: z.unknown().optional()
+})
+
 const cancelRunSchema = z.object({
   reason: z.string().optional(),
   actor: z.string().optional()
@@ -177,8 +304,15 @@ export type CreateAppOptions = {
 
 export function createApp(options: CreateAppOptions = {}) {
   const apiKey = options.apiKey ?? process.env.TIDEBASE_API_KEY
+  // HMAC key for stateless keypair challenges. Follows the resolved API key (the
+  // broker is 503 without an API key anyway, so this is set whenever reachable).
+  const challengeSecret = process.env.TIDEBASE_CHALLENGE_SECRET ?? apiKey ?? ''
+  const proveRate = Number(process.env.TIDEBASE_PROVE_RATE ?? 50) // per ip per minute
+  const grantRate = Number(process.env.TIDEBASE_GRANT_RATE ?? 300)
   const app = new Hono()
-  app.use('*', cors())
+  // CORS: agents are server-side, so the broker does not need permissive CORS.
+  // Default stays '*' for the durability core/studio; override for production.
+  app.use('*', cors({ origin: process.env.TIDEBASE_CORS_ORIGIN ?? '*' }))
   app.onError((error, c) => {
     if (error instanceof z.ZodError) {
       return c.json({ error: 'invalid request body', issues: error.issues }, 400)
@@ -189,21 +323,257 @@ export function createApp(options: CreateAppOptions = {}) {
 
   app.get('/health', (c) => c.json({ ok: true }))
 
-  // Shared-token auth: opt-in by setting TIDEBASE_API_KEY. /health stays open
-  // for probes. The SSE endpoint also accepts ?token= because EventSource
-  // cannot set request headers.
-  if (apiKey) {
-    app.use('*', async (c, next) => {
-      const header = c.req.header('authorization')
-      const bearer = header?.startsWith('Bearer ') ? header.slice('Bearer '.length) : null
-      const isEventStream = /^\/runs\/[^/]+\/events$/.test(c.req.path)
-      const candidate = bearer ?? (isEventStream ? c.req.query('token') ?? null : null)
-      if (!candidate || !timingSafeEqualString(candidate, apiKey)) {
-        return c.json({ error: 'unauthorized' }, 401)
+  // Auth middleware (always mounted). /health stays open for probes. The SSE
+  // endpoint also accepts ?token= because EventSource cannot set request headers.
+  //
+  // Two route classes:
+  //  - Durability core (runs/queues/...): opt-in shared-token auth via TIDEBASE_API_KEY,
+  //    open when no key (backward compat).
+  //  - Credential broker (isBrokerPath): MUST authenticate and fails CLOSED — without
+  //    an API key there is no way to authenticate admin operations, so we refuse to
+  //    broker credentials at all rather than serve the endpoints unauthenticated.
+  app.use('*', async (c, next) => {
+    const path = c.req.path
+    if (path === '/health') return next()
+    const broker = isBrokerPath(path)
+
+    if (!apiKey) {
+      if (broker) {
+        return c.json(
+          { error: 'credential broker disabled: set TIDEBASE_API_KEY to enable agent-auth endpoints', code: 'broker_disabled' },
+          503
+        )
       }
-      await next()
+      return next()
+    }
+
+    const header = c.req.header('authorization')
+    const bearer = header?.startsWith('Bearer ') ? header.slice('Bearer '.length) : null
+    const isEventStream = /^\/runs\/[^/]+\/events$/.test(path)
+    const candidate = bearer ?? (isEventStream ? c.req.query('token') ?? null : null)
+    const sharedTokenOk = candidate ? timingSafeEqualString(candidate, apiKey) : false
+    const agentSessionOk =
+      !sharedTokenOk && candidate ? await isValidAgentSessionForPath(candidate, path) : false
+    if (!candidate || (!sharedTokenOk && !agentSessionOk)) {
+      return c.json({ error: 'unauthorized' }, 401)
+    }
+    await next()
+  })
+
+  // Abuse resistance for the credential broker: rate-limit proof + grant mutations
+  // and cap broker request bodies (measured, not header-trusted). Backstop only —
+  // production should also front this with a gateway/Redis limiter (the in-process
+  // map is per-replica).
+  const brokerBodyLimit = bodyLimit({
+    maxSize: 64 * 1024,
+    onError: (c) => c.json({ error: 'request body too large', code: 'body_too_large' }, 413)
+  })
+  app.use('*', async (c, next) => {
+    const path = c.req.path
+    const method = c.req.method
+    if (method === 'POST' && /^\/agents\/[^/]+\/(prove|challenge)$/.test(path)) {
+      if (!(await rateLimitPg(`prove:${clientIp(c)}`, proveRate, 60_000))) {
+        return c.json({ error: 'too many proof attempts; slow down', code: 'rate_limited' }, 429)
+      }
+    } else if (method === 'POST' && /^\/runs\/[^/]+\/grants(?:\/|$)/.test(path)) {
+      if (!(await rateLimitPg(`grant:${clientIp(c)}`, grantRate, 60_000))) {
+        return c.json({ error: 'too many grant operations; slow down', code: 'rate_limited' }, 429)
+      }
+    }
+    if (method === 'POST' && isBrokerPath(path)) {
+      return brokerBodyLimit(c, next)
+    }
+    await next()
+  })
+
+  app.post('/agents', async (c) => {
+    const body = agentRegisterSchema.parse(await c.req.json())
+    const result = await pool.query(
+      `insert into agents (name, principal, identity_kind, public_key, metadata_json)
+       values ($1, $2, $3, $4, $5)
+       on conflict (principal, name)
+       do update set
+         identity_kind = excluded.identity_kind,
+         public_key = excluded.public_key,
+         metadata_json = excluded.metadata_json,
+         status = 'active',
+         updated_at = now()
+       returning *`,
+      [
+        body.name,
+        body.principal ?? null,
+        body.identityKind ?? 'dev_token',
+        body.publicKey ?? null,
+        json(body.metadata ?? {})
+      ]
+    )
+    return c.json(mapAgent(result.rows[0]))
+  })
+
+  // Issue a single-use challenge for keypair/cloud_key agents to sign.
+  app.post('/agents/:agentId/challenge', async (c) => {
+    const agentId = c.req.param('agentId')
+    const agent = await pool.query('select id, status from agents where id = $1', [agentId])
+    const row = agent.rows[0]
+    if (!row) return c.json({ error: 'agent not found' }, 404)
+    if (row.status !== 'active') return c.json({ error: 'agent is not active' }, 403)
+    if (!challengeSecret) return c.json({ error: 'challenge issuance not configured' }, 503)
+    return c.json(mintChallenge(agentId, challengeSecret))
+  })
+
+  app.post('/agents/:agentId/prove', async (c) => {
+    const agentId = c.req.param('agentId')
+    const body = agentProveSchema.parse(await c.req.json().catch(() => ({})))
+    const agent = await pool.query('select * from agents where id = $1', [agentId])
+    const row = agent.rows[0]
+    if (!row) return c.json({ error: 'agent not found' }, 404)
+    if (row.status !== 'active') return c.json({ error: 'agent is not active' }, 403)
+
+    if (row.identity_kind === 'dev_token') {
+      // Fail closed in production: dev_token has no cryptographic proof.
+      if (!allowDevToken) {
+        return c.json(
+          { error: 'dev_token identity is disabled in production; register a keypair identity', code: 'dev_token_disabled' },
+          403
+        )
+      }
+      // When a shared dev token is configured it MUST match (was previously skipped when unset).
+      const expected = process.env.TIDEBASE_DEV_AGENT_TOKEN
+      if (expected !== undefined && expected !== '') {
+        if (!body.token || !timingSafeEqualString(body.token, expected)) {
+          return c.json({ error: 'invalid agent proof' }, 401)
+        }
+      }
+    } else if (row.identity_kind === 'keypair' || row.identity_kind === 'cloud_key') {
+      if (!row.public_key) return c.json({ error: 'agent has no registered public key' }, 400)
+      if (!body.challenge || !body.signature) {
+        return c.json({ error: 'challenge and signature required for keypair proof' }, 400)
+      }
+      if (!verifyChallenge(agentId, body.challenge, challengeSecret)) {
+        return c.json({ error: 'invalid or expired challenge' }, 401)
+      }
+      if (!(await consumeChallengePg(hashToken(body.challenge), new Date(Date.now() + 90_000)))) {
+        return c.json({ error: 'challenge already used' }, 401)
+      }
+      if (!verifyKeypairProof(row.public_key, body.challenge, body.signature)) {
+        return c.json({ error: 'invalid signature' }, 401)
+      }
+    } else {
+      return c.json({ error: `${row.identity_kind} proof provider is not configured in this build` }, 501)
+    }
+
+    const sessionToken = `tdb_ags_${randomBytes(32).toString('base64url')}`
+    const expiresAt = new Date(Date.now() + 15 * 60_000)
+    await pool.query(
+      `insert into agent_sessions (agent_id, token_hash, expires_at)
+       values ($1, $2, $3)`,
+      [agentId, hashToken(sessionToken), expiresAt]
+    )
+    return c.json({ agentId, sessionToken, expiresAt: expiresAt.toISOString() })
+  })
+
+  app.get('/agents/:agentId', async (c) => {
+    const result = await pool.query('select * from agents where id = $1', [c.req.param('agentId')])
+    if (!result.rows[0]) return c.json({ error: 'agent not found' }, 404)
+    return c.json(mapAgent(result.rows[0]))
+  })
+
+  app.post('/resources', async (c) => {
+    const body = resourceConnectSchema.parse(await c.req.json())
+    const provider = body.provider ?? 'nango'
+    // connection_ref: caller-supplied opaque pointer for external backends, else a
+    // dev placeholder. Vault (static) keeps its material in resource_secrets.
+    const connectionRef = body.connectionRef ?? `dev:${provider}:${body.principal ?? 'default'}:${body.name}`
+
+    // Vault path: a directly-supplied secret must be envelope-encrypted before it
+    // touches the database. Fail closed if custody (KMS) is not configured — never
+    // store plaintext.
+    let encrypted: { material: unknown; keyId: string } | null = null
+    if (body.secret !== undefined) {
+      const credential = normalizeCredential(body.secret)
+      if (!credential) return c.json({ error: 'unrecognized secret format', code: 'bad_secret' }, 400)
+      const kms = resolveKms()
+      if (!kms) return c.json({ error: 'credential custody not configured: set TIDEBASE_MASTER_KEY', code: 'custody_unavailable' }, 503)
+      const material = encryptSecret(JSON.stringify(credential), kms)
+      encrypted = { material, keyId: kms.keyId }
+    }
+
+    const result = await tx(async (client) => {
+      const inserted = await client.query(
+        `insert into resources (principal, name, provider, kind, connection_ref, base_url, allowed_path_prefix, scopes_allowed, metadata_json)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         on conflict (principal, name)
+         do update set
+           provider = excluded.provider,
+           kind = excluded.kind,
+           connection_ref = excluded.connection_ref,
+           base_url = excluded.base_url,
+           allowed_path_prefix = excluded.allowed_path_prefix,
+           scopes_allowed = excluded.scopes_allowed,
+           metadata_json = excluded.metadata_json,
+           status = 'connected',
+           updated_at = now()
+         returning *`,
+        [
+          body.principal ?? null,
+          body.name,
+          provider,
+          provider === 'openbao' ? 'dynamic' : provider === 'static' ? 'api_key' : 'oauth',
+          connectionRef,
+          body.baseUrl ?? null,
+          body.allowedPathPrefix ?? null,
+          json(body.scopesAllowed ?? []),
+          json(body.metadata ?? {})
+        ]
+      )
+      if (encrypted) {
+        await client.query(
+          `insert into resource_secrets (resource_id, material_json, key_id)
+           values ($1, $2, $3)
+           on conflict (resource_id)
+           do update set material_json = excluded.material_json, key_id = excluded.key_id, updated_at = now()`,
+          [inserted.rows[0].id, json(encrypted.material), encrypted.keyId]
+        )
+      }
+      return inserted.rows[0]
     })
-  }
+    return c.json(mapResource(result))
+  })
+
+  app.post('/resources/:resourceId/revoke', async (c) => {
+    const resourceId = c.req.param('resourceId')
+    const result = await tx(async (client) => {
+      const revoked = await client.query(
+        `update resources set status = 'revoked', updated_at = now() where id = $1 returning id`,
+        [resourceId]
+      )
+      if (!revoked.rows[0]) return null
+      // Cascade: any live grant backed by this resource is revoked immediately,
+      // so in-flight agents lose access the moment the connection is pulled.
+      const grants = await client.query(
+        `update grants set status = 'revoked', revoked_at = now(), updated_at = now()
+         where resource_id = $1 and status in ('pending','approved','active')
+         returning id, run_id, agent_id, resource, action, mode, gate_id, expires_at`,
+        [resourceId]
+      )
+      for (const g of grants.rows) {
+        await appendEvent(client, g.run_id, 'grant.revoked', {
+          grantId: g.id,
+          resource: g.resource,
+          action: g.action,
+          agentId: g.agent_id ?? null,
+          mode: g.mode,
+          status: 'revoked',
+          gateId: g.gate_id ?? null,
+          expiresAt: g.expires_at?.toISOString?.() ?? null,
+          cause: 'resource_revoked'
+        })
+      }
+      return { id: revoked.rows[0].id, cascaded: grants.rows.length }
+    })
+    if (!result) return c.json({ error: 'resource not found' }, 404)
+    return c.json({ revoked: result.id, grantsRevoked: result.cascaded })
+  })
 
   app.post('/runs/:workflowName', async (c) => {
     const workflowName = c.req.param('workflowName')
@@ -579,6 +949,353 @@ export function createApp(options: CreateAppOptions = {}) {
     })
   })
 
+  app.post('/runs/:runId/grants', async (c) => {
+    const runId = c.req.param('runId')
+    const body = grantRequestSchema.parse(await c.req.json())
+    const session = await agentSessionFromRequest(c.req.header('authorization'))
+    if (!session) {
+      return c.json(
+        { error: 'grant operations require a proved agent session token, not the admin key', code: 'session_required' },
+        401
+      )
+    }
+    const resourceName = body.resource.split(':')[0]
+    const sessionPrincipal = session.principal ?? null
+    const result = await tx(async (client) => {
+      // Lock the run row so the trust-on-first-use principal claim is race-free.
+      const run = await client.query(
+        'select id, status, grant_principal from runs where id = $1 for update',
+        [runId]
+      )
+      if (!run.rows[0]) return { kind: 'missing_run' as const }
+      if (run.rows[0].status === 'cancelled') return { kind: 'cancelled' as const }
+
+      // Tenancy: a run is owned by the first principal to broker on it; others are denied.
+      const owner = run.rows[0].grant_principal as string | null
+      if (owner === null) {
+        await client.query('update runs set grant_principal = $1 where id = $2', [sessionPrincipal, runId])
+      } else if (owner !== sessionPrincipal) {
+        return { kind: 'cross_tenant' as const }
+      }
+
+      // Resource must belong to exactly this principal (no implicit global fallback).
+      const resource = await client.query(
+        `select * from resources
+         where name = $1
+           and status = 'connected'
+           and principal is not distinct from $2
+         limit 1`,
+        [resourceName, sessionPrincipal]
+      )
+      if (!resource.rows[0]) return { kind: 'missing_resource' as const }
+      const allowed = Array.isArray(resource.rows[0].scopes_allowed)
+        ? resource.rows[0].scopes_allowed.filter((scope: unknown): scope is string => typeof scope === 'string')
+        : []
+      const requestedScopes = body.scopes ?? []
+      const deniedScopes = allowed.length === 0 ? [] : requestedScopes.filter((scope) => !allowed.includes(scope))
+      if (deniedScopes.length > 0) return { kind: 'scope_denied' as const, deniedScopes }
+
+      const decision = evaluatePolicy({
+        action: body.action,
+        resource: body.resource,
+        requestedScopes,
+        mode: body.mode ?? 'proxy'
+      })
+      if (decision.effect === 'deny') {
+        return { kind: 'policy_denied' as const, reason: decision.reason }
+      }
+      const requiresApproval = decision.requiresApproval
+      const mode = decision.mode
+      // Don't hand out a mint token the backend can't actually back. If the
+      // provider can't mint a standalone short-lived credential, refuse rather
+      // than issue a token that maps to nothing (proxy mode is always available).
+      if (mode === 'mint' && !resolveBackend(resource.rows[0].provider as string).canMint) {
+        return { kind: 'mint_unavailable' as const }
+      }
+      let gateId: string | null = null
+      if (requiresApproval) {
+        const insertedGate = await client.query(
+          `insert into gates (run_id, name, prompt, data_json, capability_json, channels_json)
+           values ($1, $2, $3, $4, $5, '[]'::jsonb)
+           returning *`,
+          [
+            runId,
+            `grant:${body.action}:${randomUUID()}`,
+            `Approve ${body.action} on ${body.resource}`,
+            json({ reason: body.reason ?? null }),
+            json({ name: body.resource, scopes: requestedScopes, reason: body.reason ?? null })
+          ]
+        )
+        gateId = insertedGate.rows[0].id
+      }
+
+      const token = mode === 'mint' && !requiresApproval ? `tdb_grant_${randomBytes(32).toString('base64url')}` : null
+      const status = requiresApproval ? 'pending' : 'active'
+      // Pending approvals get a finite approval window so stale ones time out
+      // (the reconciler sweeps them to 'expired'). Active grants get their TTL.
+      const expiresAt = requiresApproval
+        ? new Date(Date.now() + approvalWindowMs)
+        : new Date(Date.now() + (body.ttlSeconds ?? 120) * 1000)
+      const grantResult = await client.query(
+        `insert into grants
+          (run_id, agent_id, resource_id, resource, action, scopes, reason, mode, status,
+           gate_id, token_hash, max_uses, ttl_seconds, policy_json, issued_at, expires_at)
+         values
+          ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+         returning *`,
+        [
+          runId,
+          session?.agentId ?? null,
+          resource.rows[0].id,
+          body.resource,
+          body.action,
+          json(requestedScopes),
+          body.reason ?? null,
+          mode,
+          status,
+          gateId,
+          token ? hashToken(token) : null,
+          body.maxUses ?? 1,
+          body.ttlSeconds ?? 120,
+          json({
+            provider: 'dev-reference',
+            effect: decision.effect,
+            matchedRule: decision.matchedRule,
+            requiresApproval,
+            forcedProxy: decision.forcedProxy,
+            requestedMode: body.mode ?? 'proxy',
+            scopesCeiling: allowed
+          }),
+          requiresApproval ? null : new Date(),
+          expiresAt
+        ]
+      )
+      const grant = mapGrant(grantResult.rows[0], token)
+      await appendEvent(client, runId, 'grant.requested', grantReceipt(grant, session?.agentId ?? null))
+      if (requiresApproval && gateId) {
+        await appendEvent(client, runId, 'gate.created', {
+          gate: publicGate(mapGate((await client.query('select * from gates where id = $1', [gateId])).rows[0]))
+        })
+      } else {
+        await appendEvent(client, runId, mode === 'mint' ? 'grant.minted' : 'grant.approved', grantReceipt(grant, session?.agentId ?? null))
+      }
+      return { kind: 'ok' as const, grant }
+    })
+    if (result.kind === 'missing_run') return c.json({ error: 'run not found' }, 404)
+    if (result.kind === 'cancelled') return c.json({ error: 'run is cancelled', code: 'run_cancelled' }, 409)
+    if (result.kind === 'cross_tenant') return c.json({ error: 'run is owned by a different principal', code: 'cross_tenant' }, 403)
+    if (result.kind === 'policy_denied') return c.json({ error: 'action denied by policy', code: 'policy_denied', reason: result.reason }, 403)
+    if (result.kind === 'mint_unavailable') return c.json({ error: 'mint mode requires a credential backend that can mint; use proxy mode', code: 'mint_unavailable' }, 400)
+    if (result.kind === 'missing_resource') return c.json({ error: 'resource not connected' }, 404)
+    if (result.kind === 'scope_denied') return c.json({ error: 'requested scopes exceed resource ceiling', deniedScopes: result.deniedScopes }, 403)
+    return c.json(result.grant)
+  })
+
+  app.post('/runs/:runId/grants/:grantId/use', async (c) => {
+    const runId = c.req.param('runId')
+    const grantId = c.req.param('grantId')
+    const body = grantUseSchema.parse(await c.req.json())
+    const session = await agentSessionFromRequest(c.req.header('authorization'))
+    if (!session) {
+      return c.json(
+        { error: 'grant operations require a proved agent session token, not the admin key', code: 'session_required' },
+        401
+      )
+    }
+    // Phase 1 (tx): lock + validate + authorize, then atomically RESERVE the use.
+    // `for update of g` serializes concurrent uses; the network call happens AFTER
+    // commit so the row lock / pool connection isn't held across the upstream call.
+    const reservation = await tx(async (client) => {
+      const locked = await client.query(
+        `select g.*, r.provider as r_provider, r.connection_ref as r_connection_ref,
+                r.base_url as r_base_url, r.allowed_path_prefix as r_allowed_path_prefix, r.id as r_id
+         from grants g
+         left join resources r on r.id = g.resource_id
+         where g.id = $1 and g.run_id = $2
+         for update of g`,
+        [grantId, runId]
+      )
+      const row = locked.rows[0]
+      if (!row) return { kind: 'gone' as const }
+      const usable =
+        row.status === 'active' &&
+        (row.expires_at === null || new Date(row.expires_at).getTime() > Date.now()) &&
+        row.used_count < row.max_uses &&
+        row.agent_id === session.agentId
+      if (!usable) return { kind: 'gone' as const }
+
+      // Authz on the proxied call: a grant for `*.read` cannot be replayed as DELETE.
+      const callCheck = callMatchesAction(row.action as string, body.method)
+      if (!callCheck.ok) return { kind: 'call_denied' as const, reason: callCheck.reason ?? 'call not permitted by grant' }
+
+      // Fail closed WITHOUT consuming a use if the backend itself is unavailable
+      // (pure capability check, no I/O). Runtime acquire/proxy failures after this
+      // point DO consume the use (at-most-once: a real attempt was authorized).
+      const backend = resolveBackend((row.r_provider as string) ?? 'static')
+      if (backend.kind === 'failclosed') {
+        return { kind: 'backend' as const, code: 'backend_not_configured', message: backend.failReason ?? 'backend not configured', provider: backend.name }
+      }
+
+      const update = await client.query(
+        `update grants
+         set used_count = used_count + 1,
+             status = case when used_count + 1 >= max_uses then 'used' else status end,
+             updated_at = now()
+         where id = $1 and run_id = $2 and status = 'active' and used_count < max_uses
+         returning *`,
+        [grantId, runId]
+      )
+      if (!update.rows[0]) return { kind: 'gone' as const }
+      const grant = mapGrant(update.rows[0])
+      await appendEvent(client, runId, 'grant.used', {
+        // Records WHAT was authorized — never the request body, response, or secret.
+        ...grantReceipt(grant, session.agentId),
+        call: { method: body.method, path: body.path },
+        simulated: backend.simulated
+      })
+      return {
+        kind: 'reserved' as const,
+        grant,
+        backend,
+        provider: (row.r_provider as string) ?? 'static',
+        connectionRef: (row.r_connection_ref as string) ?? '',
+        baseUrl: (row.r_base_url as string | null) ?? null,
+        allowedPathPrefix: (row.r_allowed_path_prefix as string | null) ?? null,
+        resourceId: row.r_id as string,
+        action: row.action as string,
+        scopes: Array.isArray(row.scopes) ? (row.scopes as string[]) : []
+      }
+    })
+
+    if (reservation.kind === 'call_denied') return c.json({ error: reservation.reason, code: 'call_denied' }, 403)
+    if (reservation.kind === 'backend') {
+      return c.json({ error: reservation.message, code: reservation.code, provider: reservation.provider }, 502)
+    }
+    if (reservation.kind !== 'reserved') {
+      return c.json({ error: 'grant not active, expired, revoked, exhausted, or not owned by this agent' }, 409)
+    }
+
+    // Phase 2 (no tx): acquire the live credential and perform the real proxied call.
+    const acquired = await acquireCredential(reservation.backend, {
+      kms: resolveKms(),
+      connectionRef: reservation.connectionRef,
+      resource: reservation.grant.resource,
+      scopes: reservation.scopes,
+      env: process.env,
+      loadSecretMaterial: async () => {
+        const r = await pool.query('select material_json, key_id from resource_secrets where resource_id = $1', [reservation.resourceId])
+        return r.rows[0] ? { material: r.rows[0].material_json, keyId: r.rows[0].key_id } : null
+      }
+    })
+    if (!acquired.ok) {
+      await emitUseFailed(runId, reservation.grant, session.agentId, acquired.code)
+      return c.json({ error: acquired.message, code: acquired.code, provider: reservation.backend.name }, 502)
+    }
+
+    const outcome = await executeProxy({
+      backend: reservation.backend,
+      baseUrl: reservation.baseUrl,
+      allowedPathPrefix: reservation.allowedPathPrefix,
+      call: { method: body.method, path: body.path, body: body.body },
+      credential: acquired.credential,
+      env: process.env
+    })
+    if (!outcome.ok) {
+      await emitUseFailed(runId, reservation.grant, session.agentId, outcome.code)
+      return c.json({ error: outcome.message, code: outcome.code, provider: outcome.provider }, outcome.code === 'ssrf_blocked' ? 403 : 502)
+    }
+
+    return c.json({
+      grant: reservation.grant,
+      response: {
+        ok: true,
+        mode: reservation.grant.mode,
+        proxied: true,
+        simulated: outcome.simulated,
+        provider: outcome.provider,
+        status: outcome.status,
+        body: outcome.body,
+        method: body.method,
+        path: body.path
+      }
+    })
+  })
+
+  app.post('/runs/:runId/grants/:grantId/revoke', async (c) => {
+    const runId = c.req.param('runId')
+    const grantId = c.req.param('grantId')
+    const session = await agentSessionFromRequest(c.req.header('authorization'))
+    if (!session) {
+      return c.json(
+        { error: 'grant operations require a proved agent session token, not the admin key', code: 'session_required' },
+        401
+      )
+    }
+    const result = await tx(async (client) => {
+      const update = await client.query(
+        `update grants
+         set status = 'revoked', revoked_at = now(), updated_at = now()
+         where id = $1 and run_id = $2 and status not in ('revoked','used','expired')
+         returning *`,
+        [grantId, runId]
+      )
+      if (!update.rows[0]) return null
+      const grant = mapGrant(update.rows[0])
+      await appendEvent(client, runId, 'grant.revoked', grantReceipt(grant, session?.agentId ?? null))
+      return grant
+    })
+    if (!result) return c.json({ error: 'grant not found or already terminal' }, 404)
+    return c.json({ grant: result })
+  })
+
+  app.get('/audit', async (c) => {
+    const rawLimit = Number(c.req.query('limit') ?? 100)
+    const limit = Number.isFinite(rawLimit) ? Math.min(200, Math.max(1, Math.trunc(rawLimit))) : 100
+    const runId = c.req.query('runId')
+    const agentId = c.req.query('agentId')
+    const resource = c.req.query('resource')
+    const types = (c.req.query('types') ?? '')
+      .split(',')
+      .map((type) => type.trim())
+      .filter(Boolean)
+    const clauses = [`type like 'grant.%'`]
+    const params: unknown[] = []
+    // Tenant scoping: an agent session sees only receipts for runs owned by its
+    // principal; the admin key sees everything. Without this, any session could
+    // read every tenant's grant history.
+    const session = await agentSessionFromRequest(c.req.header('authorization'))
+    if (session) {
+      params.push(session.principal ?? null)
+      clauses.push(`run_id in (select id from runs where grant_principal is not distinct from $${params.length})`)
+    }
+    if (runId) {
+      params.push(runId)
+      clauses.push(`run_id = $${params.length}`)
+    }
+    if (agentId) {
+      params.push(agentId)
+      clauses.push(`payload_json->>'agentId' = $${params.length}`)
+    }
+    if (resource) {
+      params.push(resource)
+      clauses.push(`payload_json->>'resource' = $${params.length}`)
+    }
+    if (types.length > 0) {
+      params.push(types)
+      clauses.push(`type = any($${params.length})`)
+    }
+    params.push(limit)
+    const result = await pool.query(
+      `select id, run_id, seq, type, payload_json, created_at
+       from events
+       where ${clauses.join(' and ')}
+       order by created_at desc, id desc
+       limit $${params.length}`,
+      params
+    )
+    return c.json(result.rows.map(mapAuditEntry))
+  })
+
   app.post('/runs/:runId/children', async (c) => {
     const parentRunId = c.req.param('runId')
     const body = createChildRunSchema.parse(await c.req.json())
@@ -941,6 +1658,25 @@ export function createApp(options: CreateAppOptions = {}) {
       await appendEvent(client, runId, 'gate.resolved', {
         gate: publicGate(resolved)
       })
+      const grants = await client.query(
+        `update grants
+         set status = case when $3 = 'approved' then 'active' else 'denied' end,
+             issued_at = case when $3 = 'approved' then now() else issued_at end,
+             expires_at = case when $3 = 'approved' then now() + (ttl_seconds || ' seconds')::interval else expires_at end,
+             updated_at = now()
+         where run_id = $1 and gate_id = $2 and status = 'pending'
+         returning *`,
+        [runId, gateId, body.decision]
+      )
+      for (const grantRow of grants.rows) {
+        const grant = mapGrant(grantRow)
+        await appendEvent(
+          client,
+          runId,
+          body.decision === 'approved' ? 'grant.approved' : 'grant.denied',
+          grantReceipt(grant, grantRow.agent_id ?? null)
+        )
+      }
       const deliveries = await queueChannelDeliveries(
         client,
         runId,
@@ -1864,6 +2600,126 @@ function mapGate(row: Record<string, any>) {
     updatedAt: row.updated_at.toISOString(),
     resolvedAt: row.resolved_at?.toISOString?.() ?? null
   }
+}
+
+function mapAgent(row: Record<string, any>) {
+  return {
+    agentId: row.id as string,
+    name: row.name as string,
+    principal: (row.principal as string | null) ?? null,
+    identityKind: row.identity_kind as string,
+    status: row.status as string
+  }
+}
+
+function mapResource(row: Record<string, any>) {
+  return {
+    resourceId: row.id as string,
+    name: row.name as string,
+    provider: row.provider as string,
+    status: row.status as string
+  }
+}
+
+function mapGrant(row: Record<string, any>, token?: string | null) {
+  return {
+    grantId: row.id as string,
+    runId: row.run_id as string,
+    resource: row.resource as string,
+    action: row.action as string,
+    status: row.status as string,
+    mode: row.mode as 'proxy' | 'mint',
+    ...(token ? { token } : {}),
+    expiresAt: row.expires_at?.toISOString?.() ?? null,
+    gateId: (row.gate_id as string | null) ?? null
+  }
+}
+
+function grantReceipt(
+  grant: ReturnType<typeof mapGrant>,
+  agentId: string | null
+) {
+  return {
+    grantId: grant.grantId,
+    resource: grant.resource,
+    action: grant.action,
+    agentId,
+    mode: grant.mode,
+    status: grant.status,
+    gateId: grant.gateId ?? null,
+    expiresAt: grant.expiresAt
+  }
+}
+
+async function emitUseFailed(
+  runId: string,
+  grant: ReturnType<typeof mapGrant>,
+  agentId: string,
+  code: string
+) {
+  // Best-effort audit: the use was reserved (at-most-once) but the proxy failed.
+  try {
+    await tx(async (client) => {
+      await appendEvent(client, runId, 'grant.use_failed', {
+        ...grantReceipt(grant, agentId),
+        failure: code
+      })
+    })
+  } catch {
+    // never throw from the failure path
+  }
+}
+
+function mapAuditEntry(row: Record<string, any>) {
+  const payload = isRecord(row.payload_json) ? row.payload_json : {}
+  return {
+    seq: Number(row.seq),
+    type: row.type as string,
+    grantId: typeof payload.grantId === 'string' ? payload.grantId : '',
+    resource: typeof payload.resource === 'string' ? payload.resource : '',
+    action: typeof payload.action === 'string' ? payload.action : '',
+    agentId: typeof payload.agentId === 'string' ? payload.agentId : null,
+    at: row.created_at.toISOString()
+  }
+}
+
+function hashToken(token: string) {
+  return createHash('sha256').update(token).digest('hex')
+}
+
+async function agentSessionFromRequest(authorization: string | undefined) {
+  const bearer = authorization?.startsWith('Bearer ') ? authorization.slice('Bearer '.length) : null
+  if (!bearer) return null
+  const result = await pool.query(
+    `select s.agent_id, a.principal
+     from agent_sessions s
+     join agents a on a.id = s.agent_id
+     where s.token_hash = $1
+       and s.revoked_at is null
+       and s.expires_at > now()
+       and a.status = 'active'`,
+    [hashToken(bearer)]
+  )
+  const row = result.rows[0]
+  return row ? { agentId: row.agent_id as string, principal: (row.principal as string | null) ?? null } : null
+}
+
+async function isValidAgentSessionForPath(token: string, path: string) {
+  const allowed =
+    /^\/runs\/[^/]+\/grants(?:\/|$)/.test(path) ||
+    path === '/audit'
+  if (!allowed) return false
+  const result = await pool.query(
+    `select 1
+     from agent_sessions s
+     join agents a on a.id = s.agent_id
+     where s.token_hash = $1
+       and s.revoked_at is null
+       and s.expires_at > now()
+       and a.status = 'active'`,
+    [hashToken(token)]
+  )
+  return Boolean(result.rows[0])
 }
 
 function mapState(row: Record<string, any>) {
