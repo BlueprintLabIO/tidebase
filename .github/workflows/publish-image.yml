@@ -1,4 +1,4 @@
-name: Publish server image
+name: Publish images
 
 on:
   push:
@@ -13,10 +13,16 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: tidebase
+            dockerfile: apps/server/Dockerfile
+          - image: tidebase-mcp
+            dockerfile: apps/mcp/Dockerfile
     steps:
       - uses: actions/checkout@v4
-
-      - uses: docker/setup-qemu-action@v3
 
       - uses: docker/setup-buildx-action@v3
 
@@ -29,7 +35,7 @@ jobs:
       - uses: docker/metadata-action@v5
         id: meta
         with:
-          images: ghcr.io/blueprintlabio/tidebase
+          images: ghcr.io/blueprintlabio/${{ matrix.image }}
           tags: |
             type=ref,event=tag
             type=raw,value=latest,enable={{is_default_branch}}
@@ -38,14 +44,12 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: .
-          file: apps/server/Dockerfile
-          # amd64 only: matches the deployment target (Coolify host) and builds
-          # natively on the GitHub runner. The linux/arm64 leg required QEMU
-          # emulation that, on a lockfile cache-miss, took 40+ min; re-add it with
-          # a dedicated arm64 runner or warmed cache if arm64 images are needed.
+          file: ${{ matrix.dockerfile }}
+          # amd64 only: matches the deploy target (Coolify host) and builds
+          # natively on the GitHub runner. Native arm64 is added separately.
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
