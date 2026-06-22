@@ -479,15 +479,15 @@ Everything is backed by Postgres and designed for self-hosting from day one.
 - durable gates
 - usage/resource ledger
 - dogfood workflow
+- agent auth + credential broker: per-agent keypair identity, run-bound grants, a vault that stores secrets and injects them into proxied calls (the client and the LLM never see them), a policy engine, SSRF defense, and Nango/OpenBao backends
 
 ## Not In This Alpha
 
-As of **v0.6.0 (June 2026)**. Earlier alphas listed queues, schedules, cancellation, approval gates, and API auth here — those shipped in v0.5–v0.6 (durable queues with retries/backoff, cron, authoritative cancel, exactly-once gates, session runs, opt-in bearer auth, and a reconciler that detects dead workers and re-dispatches automatically). What remains deliberately out of scope:
+As of **v0.7.0 (June 2026)**. Earlier alphas listed queues, schedules, cancellation, approval gates, API auth, and credential brokering here. Those have all shipped (v0.5 through v0.7): durable queues with retries/backoff, cron, authoritative cancel, exactly-once gates, session runs, opt-in bearer auth, a reconciler that detects dead workers and re-dispatches, and in v0.7 the agent auth control plane and credential broker. What remains deliberately out of scope:
 
-- Tidebase-hosted code execution (your runtime stays yours — this one is permanent, not pending)
+- Tidebase-hosted code execution (your runtime stays yours; this one is permanent, not pending)
 - LLM gateway/proxying
 - hosted channel adapters
-- secret custody or credential brokering
 - agent memory (conversation or embedding storage)
 - multi-tenant auth (single shared API key today)
 - hosted cloud
