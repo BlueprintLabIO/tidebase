@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "tidebase"
 version = "0.7.0"
-description = "Python SDK for Tidebase — the open-source checkpoint layer for AI agents. Wrap your steps, and failed runs resume from the last safe point, in your own Postgres."
+description = "Python SDK for Tidebase, the open-source agent auth and credential broker for AI agents. Give an agent an identity and a vault, call APIs with the secret injected, and keep checkpoints, queues, schedules, and gates in your own Postgres."
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.9"

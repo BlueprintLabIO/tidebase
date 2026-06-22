@@ -5,7 +5,7 @@
     "url": "https://github.com/BlueprintLabIO"
   },
   "metadata": {
-    "description": "Tidebase — the open-source checkpoint layer for AI agents. Checkpoints, replay, gates, and live state in your own Postgres.",
+    "description": "Tidebase: open-source agent auth and credential broker for AI agents. The agent calls real APIs without holding the keys, plus checkpoints, queues, schedules, and gates in your own Postgres.",
     "version": "0.1.0"
   },
   "plugins": [

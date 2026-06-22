@@ -5,7 +5,7 @@
 <h1 align="center">Tidebase</h1>
 
 <p align="center">
-  Checkpoints, queues, schedules, gates, live state, and cancellation for agent workflows — in your own Postgres.
+  Agent auth and credential brokering for AI agents, with checkpoints, queues, schedules, and approval gates. In your own Postgres.
 </p>
 
 <p align="center">
@@ -28,9 +28,9 @@
 
 ![Tidebase Studio](docs/assets/dashboard-shot.png)
 
-Tidebase is an open-source checkpoint layer for AI agents: wrap your steps, and failed runs resume from the last safe point — in your own Postgres, without moving execution into a new runtime.
+Tidebase gives your AI agents an identity and a vault. When an agent calls an API, the call goes through Tidebase, which injects the credential, so the agent and the model never see the key. You can scope it, audit it, and revoke it.
 
-Your code still runs in your app, worker, or job process. Tidebase stores checkpoints, state, events, gates, channel deliveries, recovery attempts, and usage records in Postgres, so "this run died at step 7 — is it safe to rerun?" always has an answer.
+It also keeps the durable parts: checkpoints, live state, queues, schedules, and approval gates, all in your own Postgres. Your code still runs in your app, worker, or job process; Tidebase does not run it. So "this run died at step 7, is it safe to rerun?" has an answer, and "the agent has my GitHub token in plaintext" stops being true.
 
 Docs: <https://tidebase.dev> · Community: [Discord](https://discord.gg/JQ5sutdP8Y) · For AI assistants: [/llms.txt](https://tidebase.dev/llms.txt)
 
@@ -38,6 +38,9 @@ Docs: <https://tidebase.dev> · Community: [Discord](https://discord.gg/JQ5sutdP
 
 Agent products usually grow the same operational plumbing:
 
+- per-agent identity instead of one shared API key
+- a vault for third-party secrets and OAuth tokens
+- a way to call APIs without handing the secret to the model
 - status tables for runs and steps
 - checkpoint blobs for partial progress
 - retry flags and manual-review states
@@ -46,11 +49,11 @@ Agent products usually grow the same operational plumbing:
 - token and cost ledgers
 - webhook glue for recovery and external review surfaces
 
-Tidebase packages that layer around your existing code. It is not an LLM proxy, queue, hosted worker runtime, or secret broker.
+Tidebase packages that layer around your existing code, plus a credential broker so agents act on real services without holding the keys. It does not run your code (your runtime stays yours), and it is not an LLM proxy or a hosted worker runtime.
 
 ## Quick Start
 
-**Fastest path (no Node needed)** — prebuilt server image:
+**Fastest path (no Node needed)**, prebuilt server image:
 
 ```bash
 docker compose --profile server up -d   # Postgres + ghcr.io/blueprintlabio/tidebase on :7373
@@ -105,6 +108,37 @@ The `plan` and `fetch-sources` steps are returned from checkpoints. Only `write-
   <img src="docs/assets/crash-resume.gif" width="820" alt="Kill the process mid-run, re-invoke with the same run id, and the workflow resumes from the last checkpoint">
 </p>
 
+## Agent auth and credential brokering
+
+Give an agent its own identity, vault a third-party secret, and let the agent call the API without ever holding the key. Tidebase makes the outbound call with the secret injected, and you can scope, audit, and revoke it.
+
+```ts
+import { Tidebase } from '@tidebase/sdk'
+
+const tide = new Tidebase({ baseUrl: 'http://localhost:7373', apiKey: process.env.TIDEBASE_API_KEY })
+
+// 1. Vault a secret behind a pinned upstream. The returned resource never carries the secret.
+await tide.resources.connect('github', {
+  provider: 'static',
+  baseUrl: 'https://api.github.com',
+  secret: process.env.GITHUB_TOKEN,
+  scopesAllowed: ['repo.read'],
+})
+
+// 2. Inside a run, request a grant for what the agent needs to do.
+const auth = tide.auth(runId)
+const grant = await auth.request({
+  resource: 'github:repo:acme/app',
+  action: 'repo.read',
+  scopes: ['repo.read'],
+})
+
+// 3. Make the call through Tidebase. The token is injected upstream; the agent and the LLM never see it.
+const res = await auth.use(grant.grantId, { method: 'GET', path: '/user' })
+```
+
+Secrets are envelope-encrypted at rest (AES-256-GCM with a KMS-wrapped DEK). `baseUrl` pins the upstream and `scopesAllowed` caps any grant, so a leaked grant can't reach an arbitrary host. The proxy blocks private IPs and metadata hosts (SSRF defense), and `GET /audit` returns grant receipts with no secret material. For OAuth providers you can delegate custody to `nango` or `openbao` and Tidebase holds only an opaque connection reference.
+
 ## Using Tidebase with AI coding agents
 
 Make every AI session in your project use Tidebase correctly:
@@ -130,7 +164,7 @@ Agent-readable docs live at [tidebase.dev/llms.txt](https://tidebase.dev/llms.tx
 
 ## Queues, schedules, and cancellation (v0.5)
 
-Tidebase can now decide **when** your code runs — while still never executing it:
+Tidebase can now decide **when** your code runs, while still never executing it:
 
 ```typescript
 // durable queue: dedupe, delay, retries with backoff, concurrency caps
@@ -146,18 +180,18 @@ await tide.enqueue('generate-report', {
 tide.workflow('generate-report', generateReport)
 await tide.work({ queues: ['reports'] })
 
-// cron (UTC, 5-field) — double-fires are structurally impossible
+// cron (UTC, 5-field), double-fires are structurally impossible
 await tide.schedules.set('daily-digest', {
   cron: '0 9 * * *',
   workflowName: 'daily-digest'
 })
 
-// authoritative, one-way cancellation — workers observe it at step/gate
+// authoritative, one-way cancellation, workers observe it at step/gate
 // boundaries; complete/fail can never resurrect a cancelled run
 await tide.runs.cancel(runId, { reason: 'customer asked', actor: 'support' })
 ```
 
-Push-mode dispatch is also available: configure a queue with an `invokeUrl` and Tidebase delivers signed `run.invoke` webhooks to your app instead of waiting for a claim. A queued job IS a run — `queued` is a lifecycle state, not a second table — so status never drifts.
+Push-mode dispatch is also available: configure a queue with an `invokeUrl` and Tidebase delivers signed `run.invoke` webhooks to your app instead of waiting for a claim. A queued job IS a run, `queued` is a lifecycle state, not a second table, so status never drifts.
 
 See [docs/production.md](docs/production.md) for the full lifecycle, replay contract, worker-death recovery model, and deploy discipline (versioned migrations via `pnpm migrate`, `TIDEBASE_AUTO_MIGRATE=0` for expand/contract deploys).
 
@@ -172,7 +206,7 @@ The suite (84 TypeScript tests + 9 Python integration tests, run in CI on every 
 What it proves:
 
 - completed steps replay from storage and never re-execute, including across crash + recovery-webhook resume
-- step and run leases are mutually exclusive and fenced — zombie workers cannot write back stale results
+- step and run leases are mutually exclusive and fenced, zombie workers cannot write back stale results
 - input-hash drift on replay is rejected before it can corrupt a run
 - failure classification honors the resume contract: unkeyed external writes park in `manual_review`, idempotency-keyed and read-only steps are `safe_replay`
 - per-run event logs are gap-free and strictly ordered under concurrent writers
@@ -204,7 +238,7 @@ await tide.run('generate-report', { runId }, async (run, input) => {
 
 ## Session Runs
 
-`tide.run()` fits work shaped like a function. For open-ended execution — a protocol gateway in front of an agent, a REPL, a run that spans many requests — attach to a run as a session instead:
+`tide.run()` fits work shaped like a function. For open-ended execution, a protocol gateway in front of an agent, a REPL, a run that spans many requests, attach to a run as a session instead:
 
 ```typescript
 const session = await tide.runs.attach('mcp-session', { input: { agent: 'hermes' } })
@@ -215,9 +249,9 @@ await session.step('tool-call', { input: args }, () => callTool(args))
 await session.complete({ calls: 12 }) // or session.fail(err)
 ```
 
-The session holds the run lease with a background heartbeat (`heartbeatMs`, default 20s). If the process dies, the heartbeat stops, the lease expires, and the reconciler takes over — requeue or recovery webhook, exactly as if a workflow worker had crashed. A session that loses its lease (`onLeaseLost`) is a zombie: the server fences its writes. Pass `runId` to resume an existing session's run; completed steps replay from storage.
+The session holds the run lease with a background heartbeat (`heartbeatMs`, default 20s). If the process dies, the heartbeat stops, the lease expires, and the reconciler takes over, requeue or recovery webhook, exactly as if a workflow worker had crashed. A session that loses its lease (`onLeaseLost`) is a zombie: the server fences its writes. Pass `runId` to resume an existing session's run; completed steps replay from storage.
 
-For a complete worked example — an MCP gateway that wraps any agent's MCP server in checkpointed tool calls and durable approval gates with one config-line change — see [`examples/mcp-gateway/`](examples/mcp-gateway/).
+For a complete worked example, an MCP gateway that wraps any agent's MCP server in checkpointed tool calls and durable approval gates with one config-line change, see [`examples/mcp-gateway/`](examples/mcp-gateway/).
 
 ## Resume Contracts
 
@@ -288,7 +322,7 @@ restore = append a new version based on an older version
 Tidebase stores and exposes the versions. Your app decides what restore or fork means for its own state targets.
 
 <p align="center">
-  <img src="docs/assets/time-travel.gif" width="820" alt="Rewind a run to an earlier step, swap the model, and fork a new branch — completed steps replay from checkpoints">
+  <img src="docs/assets/time-travel.gif" width="820" alt="Rewind a run to an earlier step, swap the model, and fork a new branch, completed steps replay from checkpoints">
 </p>
 
 ## Child Runs And Fanout
@@ -359,9 +393,9 @@ if (decision.decision !== 'approved') {
 }
 ```
 
-Webhook gate payloads include a `resolveUrl` and `resolveToken`. Credential and capability fields are audit metadata only; Tidebase does not store or broker API keys in this alpha.
+Webhook gate payloads include a `resolveUrl` and `resolveToken` so a reviewer can resolve the gate. (Credentials are handled separately by the broker; see the agent auth section.)
 
-When you cannot block on a human — an HTTP handler, a bot, a protocol gateway — use the non-blocking split that `run.gate()` is built on:
+When you cannot block on a human, an HTTP handler, a bot, a protocol gateway, use the non-blocking split that `run.gate()` is built on:
 
 ```typescript
 const gate = await run.gates.begin('approve-send', { prompt: 'Send it?', data: { reportId } })
@@ -373,7 +407,7 @@ if (gate.status === 'pending') {
 Gate begin is idempotent per name within a run: re-beginning a resolved gate returns its decision immediately, so retried callers converge on one answer.
 
 <p align="center">
-  <img src="docs/assets/gates.gif" width="820" alt="A run pauses at a durable gate, a human approves the capability, and the workflow continues — fully audited">
+  <img src="docs/assets/gates.gif" width="820" alt="A run pauses at a durable gate, a human approves the capability, and the workflow continues, fully audited">
 </p>
 
 Run a local approval channel:
@@ -499,6 +533,6 @@ This is ready for local demos and early feedback, not production.
 Important limits:
 
 - Migrations are versioned and advisory-locked; dev auto-migrates on boot, and `TIDEBASE_AUTO_MIGRATE=0` + `pnpm migrate` gives expand/contract deploy discipline.
-- API auth is opt-in: set `TIDEBASE_API_KEY` on the server and the SDK (Studio: `VITE_TIDEBASE_API_KEY`). Without it the API is open — use only in trusted local/self-hosted environments.
+- API auth is opt-in: set `TIDEBASE_API_KEY` on the server and the SDK (Studio: `VITE_TIDEBASE_API_KEY`). Without it the API is open, use only in trusted local/self-hosted environments.
 - External side effects still need idempotency keys in user code.
 - Tidebase remembers what happened and can call recovery webhooks, but it does not guarantee that user code will be available to resume.

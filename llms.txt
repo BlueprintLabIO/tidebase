@@ -1,8 +1,8 @@
 # Tidebase
 
-> Tidebase is an open-source checkpoint layer for AI agents: wrap your steps, and failed runs resume from the last safe point — in your own Postgres, without moving execution into a new runtime. It does not execute your code: your app still calls your LLMs, tools, and APIs directly, while a Postgres-backed server stores checkpoints, live state, events, approval gates, and usage records around it.
+> Tidebase gives AI agents an identity and a vault, and brokers their API calls so the agent and the model never see the secret. It also keeps the durable parts (checkpoints, live state, queues, schedules, approval gates) in your own Postgres. It does not run your code: your app still calls your LLMs, tools, and APIs directly, while a Postgres-backed server holds the credentials and the durable state around it.
 
-Key facts: TypeScript SDK (`@tidebase/sdk`, Python planned), self-hosted (Docker + Postgres), Apache-2.0, server on :7373, Studio dashboard on :5173. Guarantee: completed steps never repeat on re-invocation with the same runId — not automatic process restart; something (queue, cron, retry button, or a signed recovery webhook) must re-invoke the workflow. Alpha: no API authentication yet; not production-ready. Repo: https://github.com/BlueprintLabIO/tidebase
+Key facts: TypeScript SDK (`@tidebase/sdk`) and Python SDK (`tidebase`), self-hosted (Docker + Postgres), Apache-2.0, server on :7373, Studio dashboard on :5173. Agent auth: each agent gets a keypair identity (challenge/prove) and short-lived session tokens. Credential broker: secrets are envelope-encrypted (AES-256-GCM), the proxy injects them into outbound calls, and the upstream is pinned (SSRF defense). Durability guarantee: completed steps never repeat on re-invocation with the same runId; this is not automatic process restart, something (queue, cron, retry button, or a signed recovery webhook) must re-invoke the workflow. Alpha: not production-ready. Repo: https://github.com/BlueprintLabIO/tidebase
 
 ## Docs
 
@@ -10,7 +10,7 @@ Key facts: TypeScript SDK (`@tidebase/sdk`, Python planned), self-hosted (Docker
 - [FAQ](https://tidebase.dev/docs/faq.md): is it safe to rerun, do I need Temporal, can two workers grab one run, where data lives, production readiness
 - [How to resume a failed AI agent run](https://tidebase.dev/docs/how-to-resume-a-failed-ai-agent-run.md): replay semantics, leases, recovery webhooks
 - [How to checkpoint AI agent workflows in Postgres](https://tidebase.dev/docs/checkpoint-ai-agent-workflows-postgres.md): run.step() usage, what gets stored, step granularity
-- [The replay contract — is it safe to rerun?](https://tidebase.dev/docs/replay-contract-is-it-safe-to-rerun.md): side effects, idempotency keys, failure classification (failed_retryable / manual_review / failed)
+- [The replay contract, is it safe to rerun?](https://tidebase.dev/docs/replay-contract-is-it-safe-to-rerun.md): side effects, idempotency keys, failure classification (failed_retryable / manual_review / failed)
 - [Human approval gates for AI agents](https://tidebase.dev/docs/human-approval-gates-for-ai-agents.md): durable, exactly-once gates with webhook channels and resolve tokens
 - [Fork, time travel, and snapshot agent runs](https://tidebase.dev/docs/fork-and-time-travel-agent-runs.md): versioned state streams; snapshot = labeled version
 - [Fan out to subagents with child runs](https://tidebase.dev/docs/fanout-subagents-child-runs.md): run.fanout(), idempotent child creation by edge name, durable joins
@@ -25,7 +25,7 @@ Key facts: TypeScript SDK (`@tidebase/sdk`, Python planned), self-hosted (Docker
 
 ## For AI assistants
 
-- [MCP server](https://github.com/BlueprintLabIO/tidebase-internal/tree/main/mcp-server/README.md): @tidebase/mcp — list runs, inspect run detail, read events and state versions, resolve gates, trigger recovery
+- [MCP server](https://github.com/BlueprintLabIO/tidebase-internal/tree/main/mcp-server/README.md): @tidebase/mcp, list runs, inspect run detail, read events and state versions, resolve gates, trigger recovery
 - [Agent Skill](https://github.com/BlueprintLabIO/tidebase-internal/tree/main/skills/tidebase/SKILL.md): when and how a coding agent should reach for Tidebase
 - [AGENTS.md snippet](https://github.com/BlueprintLabIO/tidebase-internal/tree/main/templates/agents-md-snippet.md): the block `tidebase init` writes into a project so future agent sessions use Tidebase correctly
 

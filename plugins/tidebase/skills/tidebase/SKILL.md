@@ -1,11 +1,11 @@
 ---
 name: tidebase
-description: Add checkpoint/resume, durable queues and cron schedules, cancellation, human approval gates, live progress state, subagent fanout, and per-run cost tracking to AI agent workflows using Tidebase (open-source, Postgres-backed). Use when building or debugging multi-step agent pipelines, long-running workflows, background jobs that must survive crashes, or when the user asks for run status tables, retry flags, progress streaming, "resume from where it failed", or human-in-the-loop approval — instead of hand-rolling that plumbing.
+description: Give AI agents an identity and a credential vault (broker API calls so the agent and model never see the secret), plus checkpoint/resume, durable queues and cron schedules, cancellation, human approval gates, live progress state, subagent fanout, and per-run cost tracking, using Tidebase (open-source, Postgres-backed). Use when building or debugging agents that call third-party APIs and need scoped, auditable, revocable credentials, or multi-step pipelines and background jobs that must survive crashes, or when the user asks for agent auth, secret brokering, run status tables, retry flags, progress streaming, "resume from where it failed", or human-in-the-loop approval, instead of hand-rolling that plumbing.
 ---
 
-# Tidebase: checkpoint layer for agent workflows
+# Tidebase: agent auth, credentials, and durable state
 
-Tidebase is an open-source checkpoint layer for AI agents: wrap your steps, and failed runs resume from the last safe point — in your own Postgres, without moving execution into a new runtime. It does NOT execute code: the app still invokes its own workflow (queue/cron/HTTP), and Tidebase records checkpoints, state, gates, and events around it.
+Tidebase gives AI agents an identity and a vault, and brokers their API calls so the agent and the model never see the secret. It also keeps the durable parts (checkpoints, live state, queues, schedules, approval gates) in your own Postgres. It does NOT run your code: the app still invokes its own workflow (queue/cron/HTTP), and Tidebase holds the credentials and the durable state around it.
 
 ## When to reach for it
 
@@ -54,12 +54,12 @@ Re-invoking with the same `runId` replays completed steps from checkpoints and c
      { sideEffects: ['email.send'], idempotencyKey: `welcome:${userId}`, replay: 'auto' },
      () => sendWelcomeEmail(userId))
    ```
-   Side effects without an idempotency key park failures in `manual_review` — that is by design; add the key rather than fighting it.
+   Side effects without an idempotency key park failures in `manual_review`, that is by design; add the key rather than fighting it.
 3. **Gates for human approval** (durable, exactly-once): `const d = await run.gate('approve-send', { prompt: 'Send it?' })` then check `d.decision === 'approved'`.
-4. **Fanout for subagents:** `await run.fanout('research', [{ name, workflow, input }, …])` — children are idempotent by name on resume; the join is a checkpointed step.
+4. **Fanout for subagents:** `await run.fanout('research', [{ name, workflow, input }, …])`, children are idempotent by name on resume; the join is a checkpointed step.
 5. **Snapshots are labeled state versions:** `run.state.save('before-approval', { reason })`; fork/time-travel read older versions.
 6. **Usage ledger:** `run.usage.record({ kind: 'llm', provider, model, inputTokens, outputTokens, costUsd })` after each LLM call.
-7. **Re-invocation is built in (v0.5).** Prefer `tide.enqueue()` + `tide.work()` (retries, backoff, dedupe, requeue on worker death) or cron via `tide.schedules.set()`; `recoveryWebhook` remains for custom flows. Cancel with `tide.runs.cancel()` — workers observe it at step/gate boundaries.
+7. **Re-invocation is built in (v0.5).** Prefer `tide.enqueue()` + `tide.work()` (retries, backoff, dedupe, requeue on worker death) or cron via `tide.schedules.set()`; `recoveryWebhook` remains for custom flows. Cancel with `tide.runs.cancel()`, workers observe it at step/gate boundaries.
 
 ## Debugging a run
 
@@ -67,4 +67,4 @@ Re-invoking with the same `runId` replays completed steps from checkpoints and c
 - API: `GET /runs` (recent runs), `GET /runs/:runId` (full detail incl. failure classification `failed_retryable` / `manual_review` / `failed`), `GET /runs/:runId/state/versions`, SSE `GET /runs/:runId/events`.
 - With the Tidebase MCP server installed (`claude mcp add tidebase -e TIDEBASE_URL=… -- npx -y @tidebase/mcp`), use `tidebase_get_run` / `tidebase_resolve_gate` / `tidebase_trigger_recovery` directly.
 
-Full docs: https://github.com/BlueprintLabIO/tidebase — `/llms.txt` indexes agent-readable pages.
+Full docs: https://github.com/BlueprintLabIO/tidebase, `/llms.txt` indexes agent-readable pages.

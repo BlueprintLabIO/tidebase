@@ -1,4 +1,4 @@
-# Tidebase v0.7.0 — Agent auth + credential broker
+# Tidebase v0.7.0, Agent auth + credential broker
 
 v0.7.0 ships the **agent auth control plane** and a **credential broker**: each agent gets its own identity, secrets live in a vault, and Tidebase makes the outbound call with the credential injected, so the agent and the LLM never see the key. This moves "credential brokering" out of the Not-In-This-Alpha list. Tidebase still does not run your code; your runtime stays yours.
 
@@ -17,10 +17,10 @@ v0.7.0 ships the **agent auth control plane** and a **credential broker**: each 
 
 ## SDKs (`@tidebase/sdk` 0.7.0, `tidebase` 0.7.0)
 
-- `tide.agents` — `register` / `challenge` / `prove`.
-- `tide.resources` — `connect(name, { provider, baseUrl, secret, scopesAllowed })` / `revoke`.
-- `tide.auth(runId)` — `grants.request(req)` → a grant, `grants.use(grantId, { method, path, body })` → the proxied response (secret never exposed), `grants.revoke`.
-- `tide.audit.list(query)` — grant receipts.
+- `tide.agents`, `register` / `challenge` / `prove`.
+- `tide.resources`, `connect(name, { provider, baseUrl, secret, scopesAllowed })` / `revoke`.
+- `tide.auth(runId)` → a `RunAuth`: `request(req)` → a grant, `use(grantId, { method, path, body })` → the proxied response (secret never exposed), `revoke(grantId)`.
+- `tide.audit.list(query)`, grant receipts.
 
 ## Verification
 

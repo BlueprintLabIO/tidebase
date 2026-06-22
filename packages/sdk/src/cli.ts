@@ -11,9 +11,9 @@
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { resolve } from 'node:path'
 
-const SNIPPET = `## Tidebase (checkpoint layer)
+const SNIPPET = `## Tidebase (agent auth, credentials, durable state)
 
-This project uses [Tidebase](https://github.com/BlueprintLabIO/tidebase) (\`@tidebase/sdk\`) to checkpoint long-running agent workflows. Server: \`$TIDEBASE_URL\` (default \`http://localhost:7373\`), Studio dashboard on \`:5173\`.
+This project uses [Tidebase](https://github.com/BlueprintLabIO/tidebase) (\`@tidebase/sdk\`) to broker agent credentials (the agent calls APIs without holding the keys) and to checkpoint long-running agent workflows. Server: \`$TIDEBASE_URL\` (default \`http://localhost:7373\`), Studio dashboard on \`:5173\`.
 
 **When writing multi-step or long-running workflows in this repo, wrap them in Tidebase instead of hand-rolling status columns, retry flags, or checkpoint blobs:**
 
